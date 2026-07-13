@@ -28,22 +28,35 @@ cmdclass = {}
 if USE_PYBIND:
     # Only import torch if compiling
     try:
+        import torch
         from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-        extra_cuda_args = {
-            "nvcc": [
-                "--threads=8",
-                "-O3",
-                "--ftz=true",
-                "--fmad=true",
-                "--prec-div=false",
-                "--prec-sqrt=false",
-                "--generate-line-info",
-            ]
-        }
+        if torch.version.hip:
+            # hipcc is clang-based and rejects nvcc-style options. --ftz and
+            # --fmad map to the clang flags below; --prec-div/--prec-sqrt have
+            # no exact clang equivalent and are left at precise defaults.
+            extra_cuda_args = {
+                "nvcc": [
+                    "-O3",
+                    "-fgpu-flush-denormals-to-zero",
+                    "-ffp-contract=fast",
+                ]
+            }
+        else:
+            extra_cuda_args = {
+                "nvcc": [
+                    "--threads=8",
+                    "-O3",
+                    "--ftz=true",
+                    "--fmad=true",
+                    "--prec-div=false",
+                    "--prec-sqrt=false",
+                    "--generate-line-info",
+                ]
+            }
 
-        if sys.platform == "win32":
-            extra_cuda_args["nvcc"].append("--allow-unsupported-compiler")
+            if sys.platform == "win32":
+                extra_cuda_args["nvcc"].append("--allow-unsupported-compiler")
 
         # Kernel headers live in nested subdirs (e.g. optimization/lbfgs/) but the .cu
         # files #include them by bare filename, so every subdir must be on the include path.
