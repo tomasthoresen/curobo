@@ -95,7 +95,7 @@ namespace curobo{
              //uint8_t sparse_val = (sphere_idx < num_spheres) ?
              //  sparse_index[batch_horizon_idx * num_spheres + sphere_idx] : 0;
 
-             //auto warp_mask = __ballot_sync(curobo::common::fullMask, sparse_val == 1);
+             //auto warp_mask = __ballot_sync(__activemask(), sparse_val == 1);
 
              if (sphere_idx < num_spheres) {
                //if (warp_mask != 0) {
@@ -124,7 +124,7 @@ namespace curobo{
              uint8_t sparse_val = (sphere_idx < num_spheres) ?
                sparse_index[batch_horizon_idx * num_spheres + sphere_idx] : 0;
 
-             auto warp_mask = __ballot_sync(curobo::common::fullMask, sparse_val == 1);
+             auto warp_mask = __ballot_sync(__activemask(), sparse_val == 1);
 
              if (sphere_idx < num_spheres) {
                if (warp_mask != 0) {
@@ -174,7 +174,7 @@ namespace curobo{
              // All threads participate in ballot sync (use safe values for out-of-bounds threads)
              uint8_t sparse_val = (sphere_idx < num_spheres) ?
                sparse_index[batch_horizon_idx * num_spheres + sphere_idx] : 0;
-             auto warp_mask = __ballot_sync(curobo::common::fullMask, sparse_val == 1);
+             auto warp_mask = __ballot_sync(__activemask(), sparse_val == 1);
 
              if (sphere_idx < num_spheres) {
                // Read and store sphere data

@@ -85,9 +85,11 @@ namespace line_search{
           int& exploration_id,
           int& selected_id)
       {
-          // Ballot sync to collect Wolfe condition results across warp
-          unsigned msk1 = __ballot_sync(curobo::common::fullMask, wolfe_1 & condition);
-          unsigned msk  = __ballot_sync(curobo::common::fullMask, wolfe & condition);
+          // Ballot sync to collect Wolfe condition results across warp.
+          // __activemask() (not a fixed full mask) is required on HIP: the mask
+          // must equal the active-lane set or the intrinsic traps.
+          unsigned msk1 = __ballot_sync(__activemask(), wolfe_1 & condition);
+          unsigned msk  = __ballot_sync(__activemask(), wolfe & condition);
 
           // Reverse bit order to find last occurrence
           unsigned msk1_brev = __brev(msk1);

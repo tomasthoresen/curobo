@@ -85,7 +85,7 @@ namespace curobo{
         {
 
 
-          auto mask = __ballot_sync(curobo::common::fullMask, true);
+          auto mask = __ballot_sync(__activemask(), true);
 
           int shift = (knots_per_warp * interpolation_steps + 1) / 2; // Ensure correct rounding
           const int lane_idx = threadIdx.x % 32;

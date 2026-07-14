@@ -51,9 +51,13 @@ struct ReductionOperator<ReductionOp::MAX> {
 template<typename ValueType, ReductionOp Op = ReductionOp::SUM>
 __forceinline__ __device__ ValueType warp_reduce(ValueType v, const int elems)
 {
-    // auto adapts to the platform mask width: unsigned on CUDA, unsigned long
-    // long on HIP (its warp-sync intrinsics return and require a 64-bit mask).
-    auto mask = __ballot_sync(curobo::common::fullMask, true);
+    // Ballot over the currently-active lanes. HIP's warp-sync intrinsics
+    // assert that the mask equals the active-lane set (__ballot(true)) and
+    // trap otherwise; a block smaller than a warp (threadsPerBlock < warpSize,
+    // e.g. opt_dim = 7 in the line-search and L-BFGS kernels) makes a fixed
+    // full mask invalid. __activemask() is that set exactly, and the ballot
+    // return value is unchanged. auto adapts to the platform mask width.
+    auto mask = __ballot_sync(__activemask(), true);
 
     ValueType val = v;
     uint8_t lane_idx = threadIdx.x % 32;
