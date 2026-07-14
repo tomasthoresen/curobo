@@ -35,13 +35,15 @@ if USE_PYBIND:
             # hipcc is clang-based and rejects nvcc-style options. --ftz and
             # --fmad map to the clang flags below; --prec-div/--prec-sqrt have
             # no exact clang equivalent and are left at precise defaults.
-            extra_cuda_args = {
-                "nvcc": [
-                    "-O3",
-                    "-fgpu-flush-denormals-to-zero",
-                    "-ffp-contract=fast",
-                ]
-            }
+            _hip_flags = [
+                "-O3",
+                "-fgpu-flush-denormals-to-zero",
+                "-ffp-contract=fast",
+            ]
+            # Opt-in device debug info for rocgdb (CUROBO_DEVICE_DEBUG=1).
+            if os.environ.get("CUROBO_DEVICE_DEBUG", "0") == "1":
+                _hip_flags += ["-g", "-ggdb"]
+            extra_cuda_args = {"nvcc": _hip_flags}
         else:
             extra_cuda_args = {
                 "nvcc": [
