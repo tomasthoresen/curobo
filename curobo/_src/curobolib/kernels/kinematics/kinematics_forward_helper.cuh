@@ -482,7 +482,7 @@ namespace curobo{
           cumul_mat[out_row + 2] = fixedTransform[fixed_row + 2];
           cumul_mat[out_row + 3] = fixedTransform[fixed_row + 3];
         }
-        __syncwarp(warp_mask);
+        __syncwarp(__activemask());
       }
 
       template<int N_LINKS>
@@ -500,14 +500,14 @@ namespace curobo{
           for (int l = 1; l < nlinks; l++) {
             compose_link_transform_halfwarp(
               cumul_mat, local_mat, linkMap, l, matAddrBase, localAddrBase, lane_idx);
-            __syncwarp(warp_mask);
+            __syncwarp(__activemask());
           }
         } else {
         #pragma unroll 10
           for (int l = 1; l < N_LINKS; l++) {
             compose_link_transform_halfwarp(
               cumul_mat, local_mat, linkMap, l, matAddrBase, localAddrBase, lane_idx);
-            __syncwarp(warp_mask);
+            __syncwarp(__activemask());
           }
         }
       }
@@ -575,13 +575,13 @@ namespace curobo{
         #pragma unroll
         for (int offset = TILE_WIDTH >> 1; offset > 0; offset >>= 1) {
           local_weighted_com.x +=
-            __shfl_down_sync(tile_mask, local_weighted_com.x, offset, TILE_WIDTH);
+            __shfl_down_sync(__activemask(), local_weighted_com.x, offset, TILE_WIDTH);
           local_weighted_com.y +=
-            __shfl_down_sync(tile_mask, local_weighted_com.y, offset, TILE_WIDTH);
+            __shfl_down_sync(__activemask(), local_weighted_com.y, offset, TILE_WIDTH);
           local_weighted_com.z +=
-            __shfl_down_sync(tile_mask, local_weighted_com.z, offset, TILE_WIDTH);
+            __shfl_down_sync(__activemask(), local_weighted_com.z, offset, TILE_WIDTH);
           local_weighted_com.w +=
-            __shfl_down_sync(tile_mask, local_weighted_com.w, offset, TILE_WIDTH);
+            __shfl_down_sync(__activemask(), local_weighted_com.w, offset, TILE_WIDTH);
         }
 
         if (thread_in_tile == 0) {
