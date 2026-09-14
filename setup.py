@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
 #
 
 """curobo package setuptools.
