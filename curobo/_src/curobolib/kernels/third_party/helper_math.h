@@ -1127,10 +1127,13 @@ inline __host__ __device__ uint4 max(uint4 a, uint4 b)
 // - linear interpolation between a and b, based on value t in [0, 1] range
 ////////////////////////////////////////////////////////////////////////////////
 
-#if !defined(CUDART_VERSION) || (CUDART_VERSION < 13000)
+#if (!defined(CUDART_VERSION) || (CUDART_VERSION < 13000)) && !(defined(__HIP_PLATFORM_AMD__) && __cplusplus >= 202002L)
 // CUDA 13.0+ provides a built-in scalar lerp(float,float,float); our own then
 // conflicts. Skip the scalar overload on CUDA>=13 (semantics are identical: a+t*(b-a));
 // the float2/3/4 overloads below are cuRobo-specific and never conflict.
+// HIP under C++20 (the default of PyTorch 2.14 extension builds): libstdc++'s math.h brings std::lerp
+// into the global namespace, where this overload conflicts; std::lerp is constexpr and so callable
+// from HIP device code.
 inline __device__ __host__ float lerp(float a, float b, float t)
 {
     return a + t*(b-a);
