@@ -50,37 +50,98 @@ constructor for `CollisionPair` (it no longer zero-initializes), a 64-bit shift
 constant, a `const void*` cast in `cudaFuncSetAttribute` calls, and the launch
 syntax. The CUDA build has not been tested with these changes.
 
-Tested configuration:
+### Tested configurations
 
-| Item | Value |
-|---|---|
-| GPU | AMD Radeon 8060S (gfx1151), wave32 |
-| ROCm | 7.2.1 |
-| Linux kernel | 6.17.0-1020-oem |
-| Python | 3.11.15 |
-| PyTorch | 2.11.0+rocm7.2 |
-| Warp | warp-lang 1.12.0.dev0, ROCm port, with the graph-capture change described below |
+Verified on 2026-09-25 on an AMD Ryzen AI Max+ 395 with Radeon 8060S (gfx1151),
+Ubuntu 24.04. Both configurations pass cuRobo's forward kinematics, inverse
+kinematics and motion planning self-tests with the default runtime settings.
 
-Build:
+| Item | ROCm 7.14 | ROCm 7.2.1 |
+|---|---|---|
+| ROCm (compiler) | 7.14.1 | 7.2.1 |
+| HIP runtime in use | 7.13, bundled with the PyTorch wheel | 7.2, bundled with the PyTorch wheel |
+| Python | 3.12 | 3.11 |
+| PyTorch | 2.10.0+rocm7.13.0a20260513 (AMD gfx1151 index) | 2.11.0+rocm7.2 (PyTorch index) |
+| Warp | [tomasthoresen/warp](https://github.com/tomasthoresen/warp/tree/amd-integration-halo), branch `amd-integration-halo` (1.17.0) | same |
 
+cuRobo depends on NVIDIA Warp. The `warp-lang` package on PyPI has no ROCm
+backend. The Warp branch above is a ROCm/HIP port of Warp 1.17.0, and its
+`wp.from_torch` does not synchronize the stream during graph capture, which
+cuRobo's CUDA graph path requires.
+
+### Install (ROCm 7.14)
+
+Requirements: a gfx1151 GPU, ROCm 7.14 under `/opt/rocm`, and on Ubuntu 24.04
+the packages `python3.12-venv python3.12-dev build-essential git`. The install
+downloads about 3 GB (PyTorch and its ROCm libraries, plus a Clang toolchain
+that the Warp build fetches), uses about 7 GB of disk, and took about 6 minutes
+on the test machine.
+
+```bash
+export ROCM_PATH=/opt/rocm
+# Warp loads hipRTC from the ROCm install. A ROCm 7.14 install without an
+# ld.so.conf.d entry needs its library directory on LD_LIBRARY_PATH.
+export LD_LIBRARY_PATH="$(dirname "$(find -L "$ROCM_PATH" -maxdepth 3 -name 'libamdhip64.so.7' | head -1)")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# The environment must live outside the source directories: the cuRobo build
+# runs PyTorch's hipify over the directory tree of the source checkout.
+python3.12 -m venv ~/venvs/curobo-rocm
+source ~/venvs/curobo-rocm/bin/activate
+pip install --upgrade pip
+pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ "torch==2.10.0+rocm7.13.0a20260513"
+pip install numpy setuptools packaging wheel ninja
+
+mkdir -p ~/src && cd ~/src
+
+# Warp first, so that it satisfies cuRobo's warp-lang dependency.
+git clone -b amd-integration-halo https://github.com/tomasthoresen/warp.git
+cd warp && ./build_amd.sh && pip install -e . && cd ..
+
+git clone https://github.com/tomasthoresen/curobo.git
+cd curobo
+ROCM_HOME="$ROCM_PATH" PATH="$ROCM_PATH/bin:$PATH" \
+CUROBO_USE_PYBIND=1 PYTORCH_ROCM_ARCH=gfx1151 \
+  pip install -e . --no-build-isolation
 ```
-CUROBO_USE_PYBIND=1 PYTORCH_ROCM_ARCH=gfx1151 MAX_JOBS=8 pip install -e . --no-build-isolation
+
+For ROCm 7.2.1, set `ROCM_PATH=/opt/rocm-7.2.1`, create the environment with
+Python 3.11 (Ubuntu 24.04 does not ship it; `uv python install 3.11` or the
+deadsnakes PPA provide it), and install PyTorch with
+`pip install --index-url https://download.pytorch.org/whl/rocm7.2 "torch==2.11.0+rocm7.2"`.
+
+`KNOWN_ISSUES-AMD.md` in the Warp repository documents one runtime defect per
+ROCm version: a graph-capture memory leak on 7.2.x in sustained runs, and
+failed small device allocations on 7.14 under capture-heavy load.
+
+### Check
+
+In a new terminal:
+
+```bash
+export ROCM_PATH=/opt/rocm
+export LD_LIBRARY_PATH="$(dirname "$(find -L "$ROCM_PATH" -maxdepth 3 -name 'libamdhip64.so.7' | head -1)")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+source ~/venvs/curobo-rocm/bin/activate
+cd ~
+python -m curobo.examples.getting_started.forward_kinematics --test
+python -m curobo.examples.getting_started.inverse_kinematics --test
+python -m curobo.examples.getting_started.motion_planning --test
 ```
 
-Runtime settings:
+Each command exits with status 0 on success. The motion planning example writes
+trajectory plots to `~/.cache/curobo/examples/motion_planning/`. Three warnings
+are expected and harmless: `cuda.core backend not available` (with advice to
+install `cuda-core`, which does not apply on AMD), `HIPRTC does not support
+precompiled headers`, and `bgemm_internal_cublaslt error:
+HIPBLAS_STATUS_NOT_SUPPORTED`.
+
+### Runtime notes
+
 - cuRobo selects the pybind backend when the `cuda_core` backend cannot be
   imported, which is the case when NVIDIA's `cuda.core` package is not
   installed. `cuda.core` targets the CUDA driver and has no HIP path.
-- `curobo.runtime.cuda_graphs = True` requires a Warp build whose
-  `wp.from_torch` does not synchronize the stream while a graph is being
-  captured. With other Warp builds, set `curobo.runtime.cuda_graphs = False`.
-- `curobo.runtime.cuda_streams = False`.
-
-Functional verification (2026-09-14): forward kinematics (Franka), single-goal
-inverse kinematics, collision-free inverse kinematics (batch of 50), batched
-inverse kinematics (`batched_ik_example`), motion planning to a tool pose, and
-motion planning to a joint-space goal all pass. On 2026-09-25 the same cases
-passed again, with the generated HIP sources rebuilt from an untracked state.
+- CUDA graphs (`curobo.runtime.cuda_graphs`) and multiple streams
+  (`curobo.runtime.cuda_streams`) keep their default value, `True`, in the
+  tested configurations.
 
 License: Apache-2.0, as upstream (`LICENSE`). Robot assets are covered by
 `LICENSE_ASSETS`. Commits before `457b658` (the cuRobo v2 release, 2026-04-18)
