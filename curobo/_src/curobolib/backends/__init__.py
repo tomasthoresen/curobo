@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
 #
 
 """Backend selector for curobolib kernels.
@@ -55,6 +56,9 @@ def _try_load_cuda_core_backend() -> Optional[dict]:
 def _try_load_pybind_backend() -> Optional[dict]:
     """Try to load pre-compiled PyBind11 extensions"""
     try:
+        # The extensions link against libtorch; importing torch first loads it.
+        import torch  # noqa: F401
+
         from curobo._src.curobolib.backends.pybind import (
             geometry as _geo,
         )
@@ -68,7 +72,7 @@ def _try_load_pybind_backend() -> Optional[dict]:
             trajectory as _traj,
         )
 
-        return {
+        modules = {
             "kinematics": _kin,
             "optimization": _opt,
             "trajectory": _traj,
@@ -77,6 +81,15 @@ def _try_load_pybind_backend() -> Optional[dict]:
     except ImportError:
         # Pybind extensions not compiled
         return None
+
+    try:
+        from curobo._src.curobolib.backends.pybind import dynamics as _dyn
+    except ImportError:
+        # Extensions built from a tree without the dynamics module; the rest still works.
+        pass
+    else:
+        modules["dynamics"] = _dyn
+    return modules
 
 
 def _load_cuda_core_backend() -> dict:
@@ -111,8 +124,8 @@ def _auto_select_backend() -> tuple:
     Raises:
         RuntimeError: If no backend is available
     """
-    # Check runtime flag override
-    backend_pref = runtime.kernel_backend.lower()
+    # Environment variable first, then the runtime flag
+    backend_pref = os.environ.get("CUROBO_KERNEL_BACKEND", runtime.kernel_backend).lower()
 
     if backend_pref == "cuda_core":
         return ("cuda_core", _load_cuda_core_backend())
@@ -189,10 +202,10 @@ class _BackendProxy:
     cuda-core (CPU-only docs builds, type-checkers, IDE indexers, examples that
     only construct configs).
 
-    If the active backend does not expose the requested module (e.g. ``dynamics``
-    and ``pba`` are only implemented for cuda.core), accessing any attribute on
-    the proxy raises a clear error via ``log_and_raise`` instead of a bare
-    ``KeyError``.
+    If the active backend does not expose the requested module (``pba`` is only
+    implemented for cuda.core; ``dynamics`` needs compiled extensions that include
+    it), accessing any attribute on the proxy raises a clear error via
+    ``log_and_raise`` instead of a bare ``KeyError``.
     """
 
     _MODULES = frozenset(
@@ -209,8 +222,9 @@ class _BackendProxy:
             if self._name not in backends:
                 log_and_raise(
                     f"Backend module '{self._name}' is not available in the "
-                    f"active backend '{get_backend_name()}'. This kernel module "
-                    f"is currently only implemented in the cuda_core backend."
+                    f"active backend '{get_backend_name()}'. 'pba' is only "
+                    f"implemented in the cuda_core backend; 'dynamics' needs the "
+                    f"compiled extensions built from a source tree that includes it."
                 )
             self._mod = backends[self._name]
         return getattr(self._mod, attr)

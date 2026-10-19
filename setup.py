@@ -108,6 +108,15 @@ if USE_PYBIND:
                 include_dirs=kernel_include_dirs,
                 extra_compile_args=extra_cuda_args,
             ),
+            CUDAExtension(
+                "curobo._src.curobolib.backends.pybind.dynamics",
+                [
+                    "curobo/_src/curobolib/backends/pybind/dynamics_bindings.cpp",
+                    "curobo/_src/curobolib/backends/pybind/rnea_kernel_launch.cu",
+                ],
+                include_dirs=kernel_include_dirs,
+                extra_compile_args=extra_cuda_args,
+            ),
         ]
 
         cmdclass = {"build_ext": BuildExtension}

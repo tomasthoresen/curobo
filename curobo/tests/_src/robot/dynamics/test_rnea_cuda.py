@@ -1078,3 +1078,55 @@ class TestGradientsVsPinocchio:
             ):
                 want = (np.asarray(mat).T @ tau_bar_pin)[perm]
                 np.testing.assert_allclose(got[b], want, err_msg=f"{label}: {name}", **PARITY_TOL)
+
+
+# ---------------------------------------------------------------------------
+# Compiled (pybind) backend: launch geometry parity with the cuda.core helper
+# ---------------------------------------------------------------------------
+
+try:
+    from curobo._src.curobolib.backends.pybind import dynamics as _compiled_dynamics
+
+    COMPILED_DYNAMICS_AVAILABLE = hasattr(_compiled_dynamics, "rnea_launch_config")
+except ImportError:
+    COMPILED_DYNAMICS_AVAILABLE = False
+
+
+@pytest.mark.skipif(not COMPILED_DYNAMICS_AVAILABLE, reason="compiled dynamics extension not built")
+class TestCompiledLaunchConfig:
+    """The compiled launcher lays out blocks exactly like DynamicsLaunchCfg."""
+
+    LINK_COUNTS = [10, 13, 22, 56, 120]
+    BATCH_SIZES = [1, 7, 31, 32, 33, 128, 1000, 4096]
+
+    @pytest.mark.parametrize("backward", [False, True])
+    @pytest.mark.parametrize("threads_per_batch", TREE_THREADS)
+    def test_matches_cuda_core_helper(self, threads_per_batch, backward):
+        """Grid, block and shared-memory size agree for every robot size and batch."""
+        from curobo._src.curobolib.backends.cuda_core_backend.dynamics_config import (
+            DynamicsLaunchCfg,
+        )
+
+        calculate = (
+            DynamicsLaunchCfg.calculate_backward_geometry
+            if backward
+            else DynamicsLaunchCfg.calculate_forward_geometry
+        )
+        for num_links in self.LINK_COUNTS:
+            for batch_size in self.BATCH_SIZES:
+                expected = tuple(int(v) for v in calculate(batch_size, num_links, threads_per_batch))
+                got = tuple(
+                    int(v)
+                    for v in _compiled_dynamics.rnea_launch_config(
+                        batch_size, num_links, threads_per_batch, backward
+                    )
+                )
+                assert got == expected, (
+                    f"links={num_links} batch={batch_size} tpb={threads_per_batch} "
+                    f"backward={backward}: compiled {got} vs cuda.core {expected}"
+                )
+
+    def test_rejects_oversized_robot(self):
+        """A robot whose single batch element exceeds the shared-memory cap is refused."""
+        with pytest.raises(RuntimeError):
+            _compiled_dynamics.rnea_launch_config(1, 2000, 1, False)
