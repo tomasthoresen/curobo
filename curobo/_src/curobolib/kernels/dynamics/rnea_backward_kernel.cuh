@@ -1,6 +1,7 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
+ * Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
  */
 /**
  * @file rnea_backward_kernel.cuh
@@ -91,8 +92,6 @@ __global__ void rnea_backward_kernel(
     const int batch = global_tid / TPB;
     const int worker = (TPB > 1) ? (global_tid % TPB) : 0;
 
-    if (TPB == 1 && batch >= batch_size) return;
-
     const bool active = (batch < batch_size);
 
     // ------------------------------------------------------------------
@@ -159,6 +158,12 @@ __global__ void rnea_backward_kernel(
         }
     }
     __syncthreads();  // Ensure all threads see the loaded inertia params
+
+    // Serial path: a thread past the end of the batch may leave only now.
+    // It had to take part in the block-shared load and the barrier above,
+    // otherwise the active rows of a partially filled last block would read
+    // links that nobody loaded.
+    if (TPB == 1 && batch >= batch_size) return;
 
     // ==================================================================
     // Load forward intermediates (v, a, f) from cache into shared memory.
