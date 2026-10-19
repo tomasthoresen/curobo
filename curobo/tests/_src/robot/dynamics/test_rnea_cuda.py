@@ -663,3 +663,418 @@ class TestOptimizationConvergence:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x", "--tb=short"])
+
+
+# ---------------------------------------------------------------------------
+# Backend parity cases: external wrenches, tree-parallel launches, mimic
+# joints and batch shapes. These run unchanged on every kernel backend.
+# ---------------------------------------------------------------------------
+
+PARITY_TOL = {"atol": 1e-3, "rtol": 1e-3}
+PARITY_ROBOTS = ["franka.yml", "ur10e.yml", "dual_ur10e.yml", "unitree_g1.yml"]
+TREE_THREADS = [1, 4, 8, 16, 32]
+TREE_BATCH_SIZES = [1, 5, 33]
+
+
+def _make_dynamics(kp, device_cfg, batch_size, gravity=-9.81, threads_per_batch=None):
+    """Create a Dynamics model, optionally forcing the tree-parallel thread count.
+
+    Args:
+        kp: KinematicsParams of the robot.
+        device_cfg: Device configuration.
+        batch_size: Batch size to allocate buffers for.
+        gravity: Gravity along z.
+        threads_per_batch: Threads per batch element for the kernels (None = the
+            model's own choice, 1 for serial chains).
+
+    Returns:
+        Dynamics instance ready for compute_inverse_dynamics.
+    """
+    from curobo._src.robot.dynamics.dynamics import Dynamics
+    from curobo._src.robot.dynamics.dynamics_cfg import DynamicsCfg
+
+    cfg = DynamicsCfg(
+        kinematics_config=kp,
+        device_cfg=device_cfg,
+        gravity=[0.0, 0.0, gravity],
+    )
+    dynamics = Dynamics(cfg)
+    dynamics.setup_batch_size(batch_size=batch_size)
+    if threads_per_batch is not None:
+        dynamics._threads_per_batch = threads_per_batch
+    return dynamics
+
+
+def _random_inputs(num_dof, batch_size, seed):
+    """Seeded joint positions, velocities, accelerations and upstream gradient."""
+    rng = np.random.RandomState(seed)
+    q = rng.uniform(-1.5, 1.5, size=(batch_size, num_dof))
+    qd = rng.randn(batch_size, num_dof)
+    qdd = rng.randn(batch_size, num_dof)
+    tau_bar = rng.randn(batch_size, num_dof)
+    return q, qd, qdd, tau_bar
+
+
+def _run_cuda_fwd_bwd(dynamics, device, q_np, qd_np, qdd_np, tau_bar_np, f_ext_np=None):
+    """Forward and VJP on the device.
+
+    Args:
+        dynamics: Dynamics model (buffers already allocated).
+        device: Torch device.
+        q_np, qd_np, qdd_np: [batch, num_dof] joint state.
+        tau_bar_np: [batch, num_dof] upstream gradient dL/dtau.
+        f_ext_np: [batch, num_links, 6] external wrenches, or None.
+
+    Returns:
+        tau, grad_q, grad_qd, grad_qdd, grad_f_ext (None without f_ext), as NumPy copies.
+    """
+    from curobo._src.state.state_joint import JointState
+
+    def _leaf(x):
+        return torch.tensor(x, dtype=torch.float32, device=device, requires_grad=True)
+
+    q_t, qd_t, qdd_t = _leaf(q_np), _leaf(qd_np), _leaf(qdd_np)
+    f_ext_t = _leaf(f_ext_np) if f_ext_np is not None else None
+    joint_state = JointState(position=q_t, velocity=qd_t, acceleration=qdd_t)
+    tau = dynamics.compute_inverse_dynamics(joint_state, f_ext=f_ext_t)
+    tau_np = tau.detach().cpu().numpy().copy()
+    tau.backward(torch.tensor(tau_bar_np, dtype=torch.float32, device=device))
+    grads = [t.grad.detach().cpu().numpy().copy() for t in (q_t, qd_t, qdd_t)]
+    grad_f_ext = f_ext_t.grad.detach().cpu().numpy().copy() if f_ext_t is not None else None
+    return (tau_np, *grads, grad_f_ext)
+
+
+def _numpy_rnea_with_f_ext(kp, q, qd, qdd, f_ext, gravity=-9.81):
+    """NumPy RNEA with external wrenches, built on the reference primitives.
+
+    tau is linear in f_ext and v, a do not depend on it, so the wrench
+    contribution is the tip-to-base propagation of -f_ext on its own:
+    f[k] = I*a + v x* (I*v) - f_ext[k] before propagation.
+
+    Args:
+        kp: KinematicsParams.
+        q, qd, qdd: [num_dof] joint state (one sample).
+        f_ext: [num_links, 6] wrenches [torque(3), force(3)] in each link frame.
+        gravity: Gravity along z.
+
+    Returns:
+        tau [num_dof], and the f_ext-aware v, a, f [num_links, 6] for the adjoint.
+    """
+    from curobo.tests._src.robot.dynamics.rnea_numpy_reference import (
+        FIXED,
+        build_joint_transform,
+        get_joint_s_index,
+        spatial_transform_transpose_multiply,
+    )
+
+    tau, v, a, f = rnea_from_kinematics_params(q, qd, qdd, kp, gravity)
+    fixed_transforms = kp.fixed_transforms.cpu().numpy()
+    link_map = kp.link_map.cpu().numpy()
+    joint_map = kp.joint_map.cpu().numpy()
+    joint_map_type = kp.joint_map_type.cpu().numpy()
+    num_links = len(link_map)
+    offsets = kp.joint_offset_map.cpu().numpy().reshape(num_links, 2)
+
+    f_x = -np.asarray(f_ext, dtype=np.float64).copy()
+    tau_x = np.zeros_like(tau)
+    for k in range(num_links - 1, -1, -1):
+        jtype = int(joint_map_type[k])
+        jidx = int(joint_map[k])
+        parent = int(link_map[k])
+        q_k = 0.0
+        if jtype != FIXED and jidx >= 0:
+            multiplier, offset = offsets[k]
+            q_k = multiplier * q[jidx] + offset
+            tau_x[jidx] += multiplier * f_x[k, get_joint_s_index(jtype)]
+        if parent >= 0 and parent != k:
+            R, p = build_joint_transform(fixed_transforms[k], jtype, q_k)
+            f_x[parent] += spatial_transform_transpose_multiply(R, p, f_x[k])
+    return tau + tau_x, v, a, f + f_x
+
+
+def _numpy_fwd_bwd(kp, q_np, qd_np, qdd_np, tau_bar_np, f_ext_np=None, gravity=-9.81):
+    """NumPy reference forward and adjoint for a batch (optionally with wrenches)."""
+    from curobo.tests._src.robot.dynamics.rnea_numpy_reference import (
+        rnea_backward_from_kinematics_params,
+    )
+
+    taus, gqs, gqds, gqdds = [], [], [], []
+    for b in range(q_np.shape[0]):
+        if f_ext_np is None:
+            tau, v, a, f = rnea_from_kinematics_params(
+                q_np[b], qd_np[b], qdd_np[b], kp, gravity
+            )
+        else:
+            tau, v, a, f = _numpy_rnea_with_f_ext(
+                kp, q_np[b], qd_np[b], qdd_np[b], f_ext_np[b], gravity
+            )
+        gq, gqd, gqdd = rnea_backward_from_kinematics_params(
+            tau_bar_np[b], q_np[b], qd_np[b], qdd_np[b], v, a, f, kp, gravity
+        )
+        taus.append(tau)
+        gqs.append(gq)
+        gqds.append(gqd)
+        gqdds.append(gqdd)
+    return np.stack(taus), np.stack(gqs), np.stack(gqds), np.stack(gqdds)
+
+
+def _assert_fwd_bwd_close(cuda_out, ref_out, label):
+    """Compare (tau, grad_q, grad_qd, grad_qdd) with the parity tolerance."""
+    names = ["tau", "grad_q", "grad_qd", "grad_qdd"]
+    for name, got, want in zip(names, cuda_out[:4], ref_out[:4]):
+        np.testing.assert_allclose(got, want, err_msg=f"{label}: {name}", **PARITY_TOL)
+
+
+class TestExternalForces:
+    """External wrenches: forward torques and all four gradients."""
+
+    @pytest.mark.parametrize("robot_yml", PARITY_ROBOTS)
+    def test_forward_backward_vs_numpy(self, robot_yml):
+        """tau(f_ext) and grad_q/qd/qdd under f_ext match the NumPy reference."""
+        kp, device_cfg = _load_robot(robot_yml)
+        batch_size = 4
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=7)
+        rng = np.random.RandomState(11)
+        f_ext = rng.randn(batch_size, kp.num_links, 6)
+
+        dynamics = _make_dynamics(kp, device_cfg, batch_size)
+        cuda_out = _run_cuda_fwd_bwd(dynamics, device_cfg.device, q, qd, qdd, tau_bar, f_ext)
+        ref_out = _numpy_fwd_bwd(kp, q, qd, qdd, tau_bar, f_ext)
+        _assert_fwd_bwd_close(cuda_out, ref_out, f"{robot_yml} f_ext")
+
+        # The wrench term must change the torques (guards against f_ext being ignored).
+        tau_no_ext = _run_cuda_fwd_bwd(dynamics, device_cfg.device, q, qd, qdd, tau_bar)[0]
+        assert np.abs(cuda_out[0] - tau_no_ext).max() > 1e-2
+
+    @pytest.mark.parametrize("robot_yml", PARITY_ROBOTS)
+    def test_grad_f_ext_vs_finite_differences(self, robot_yml):
+        """grad_f_ext equals the finite-difference VJP (tau is linear in f_ext)."""
+        kp, device_cfg = _load_robot(robot_yml)
+        num_links = kp.num_links
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, 1, seed=3)
+        rng = np.random.RandomState(5)
+        f_ext = rng.randn(1, num_links, 6)
+
+        dynamics = _make_dynamics(kp, device_cfg, 1)
+        grad_f_ext = _run_cuda_fwd_bwd(
+            dynamics, device_cfg.device, q, qd, qdd, tau_bar, f_ext
+        )[4]
+
+        # Central differences over every wrench component, in one batched forward call.
+        step = 1.0
+        n_pert = num_links * 6
+        f_batch = np.repeat(f_ext, 2 * n_pert, axis=0)
+        for idx in range(n_pert):
+            k, i = divmod(idx, 6)
+            f_batch[2 * idx, k, i] += step
+            f_batch[2 * idx + 1, k, i] -= step
+        dyn_fd = _make_dynamics(kp, device_cfg, 2 * n_pert)
+        tau_fd = _run_cuda_fwd_bwd(
+            dyn_fd,
+            device_cfg.device,
+            np.repeat(q, 2 * n_pert, axis=0),
+            np.repeat(qd, 2 * n_pert, axis=0),
+            np.repeat(qdd, 2 * n_pert, axis=0),
+            np.repeat(tau_bar, 2 * n_pert, axis=0),
+            f_batch,
+        )[0]
+        dtau = (tau_fd[0::2] - tau_fd[1::2]) / (2.0 * step)  # [n_pert, num_dof]
+        grad_fd = (dtau @ tau_bar[0]).reshape(num_links, 6)
+
+        np.testing.assert_allclose(
+            grad_f_ext[0], grad_fd, err_msg=f"{robot_yml}: grad_f_ext vs FD", **PARITY_TOL
+        )
+        assert np.abs(grad_f_ext).max() > 1e-3
+
+
+class TestTreeParallel:
+    """Tree-parallel launches (threads_per_batch > 1) against serial and NumPy."""
+
+    @pytest.mark.parametrize("batch_size", TREE_BATCH_SIZES)
+    @pytest.mark.parametrize("threads_per_batch", TREE_THREADS)
+    @pytest.mark.parametrize("robot_yml", ["franka.yml", "dual_ur10e.yml", "unitree_g1.yml"])
+    def test_forward_backward(self, robot_yml, threads_per_batch, batch_size):
+        """Every thread count gives the NumPy reference and the serial result."""
+        kp, device_cfg = _load_robot(robot_yml)
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=batch_size)
+        label = f"{robot_yml} tpb={threads_per_batch} batch={batch_size}"
+
+        dyn_tree = _make_dynamics(kp, device_cfg, batch_size, threads_per_batch=threads_per_batch)
+        tree_out = _run_cuda_fwd_bwd(dyn_tree, device_cfg.device, q, qd, qdd, tau_bar)
+        ref_out = _numpy_fwd_bwd(kp, q, qd, qdd, tau_bar)
+        _assert_fwd_bwd_close(tree_out, ref_out, label + " vs numpy")
+
+        dyn_serial = _make_dynamics(kp, device_cfg, batch_size, threads_per_batch=1)
+        serial_out = _run_cuda_fwd_bwd(dyn_serial, device_cfg.device, q, qd, qdd, tau_bar)
+        _assert_fwd_bwd_close(tree_out, serial_out, label + " vs serial")
+
+    @pytest.mark.parametrize("threads_per_batch", [4, 8, 16, 32])
+    def test_external_forces(self, threads_per_batch):
+        """Wrench gradients also hold on the tree-parallel path (branched robot)."""
+        kp, device_cfg = _load_robot("dual_ur10e.yml")
+        batch_size = 5
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=21)
+        rng = np.random.RandomState(22)
+        f_ext = rng.randn(batch_size, kp.num_links, 6)
+
+        dyn_tree = _make_dynamics(kp, device_cfg, batch_size, threads_per_batch=threads_per_batch)
+        tree_out = _run_cuda_fwd_bwd(dyn_tree, device_cfg.device, q, qd, qdd, tau_bar, f_ext)
+        dyn_serial = _make_dynamics(kp, device_cfg, batch_size, threads_per_batch=1)
+        serial_out = _run_cuda_fwd_bwd(dyn_serial, device_cfg.device, q, qd, qdd, tau_bar, f_ext)
+
+        label = f"dual_ur10e tpb={threads_per_batch} f_ext"
+        _assert_fwd_bwd_close(tree_out, serial_out, label)
+        np.testing.assert_allclose(
+            tree_out[4], serial_out[4], err_msg=label + ": grad_f_ext", **PARITY_TOL
+        )
+        ref_out = _numpy_fwd_bwd(kp, q, qd, qdd, tau_bar, f_ext)
+        _assert_fwd_bwd_close(tree_out, ref_out, label + " vs numpy")
+
+
+class TestMimicJoints:
+    """Mimic joints (multiplier and offset) on a chain with real inertias."""
+
+    @staticmethod
+    def _mimic_params(robot_yml="ur10e.yml", multiplier=-1.5, offset=0.5):
+        """Make the link driven by joint 2 mimic joint 1 on a clone of the robot's params."""
+        from curobo.tests._src.robot.dynamics.rnea_numpy_reference import FIXED
+
+        kp, device_cfg = _load_robot(robot_yml)
+        kp = kp.clone()
+        joint_map = kp.joint_map.cpu().numpy()
+        joint_map_type = kp.joint_map_type.cpu().numpy()
+        movable = [k for k in range(kp.num_links) if joint_map_type[k] != FIXED and joint_map[k] >= 0]
+        k_src = next(k for k in movable if joint_map[k] == 1)
+        k_mimic = next(k for k in movable if joint_map[k] == 2)
+        kp.joint_map[k_mimic] = int(joint_map[k_src])
+        kp.joint_offset_map[2 * k_mimic] = multiplier
+        kp.joint_offset_map[2 * k_mimic + 1] = offset
+        return kp, device_cfg
+
+    def test_forward_backward_vs_numpy(self):
+        """Torques and gradients of a mimic chain match the NumPy reference."""
+        kp, device_cfg = self._mimic_params()
+        batch_size = 6
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=31)
+        dynamics = _make_dynamics(kp, device_cfg, batch_size)
+        cuda_out = _run_cuda_fwd_bwd(dynamics, device_cfg.device, q, qd, qdd, tau_bar)
+        ref_out = _numpy_fwd_bwd(kp, q, qd, qdd, tau_bar)
+        _assert_fwd_bwd_close(cuda_out, ref_out, "ur10e mimic")
+
+        # Joint 2 no longer drives a link: its torque and gradients are zero,
+        # and the mimic must leave a trace in the torques of joint 1.
+        for arr in cuda_out[:4]:
+            assert np.abs(arr[:, 2]).max() == 0.0
+        plain_kp, _ = _load_robot("ur10e.yml")
+        plain = _make_dynamics(plain_kp, device_cfg, batch_size)
+        plain_out = _run_cuda_fwd_bwd(plain, device_cfg.device, q, qd, qdd, tau_bar)
+        assert np.abs(cuda_out[0][:, 1] - plain_out[0][:, 1]).max() > 1e-2
+
+
+class TestBatchShapes:
+    """Large and warp-unaligned batches, forward and backward."""
+
+    def test_large_batch_forward_backward(self):
+        """Batch 1000 on Franka: a sample of rows matches the NumPy reference."""
+        kp, device_cfg = _load_robot("franka.yml")
+        batch_size = 1000
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=41)
+        dynamics = _make_dynamics(kp, device_cfg, batch_size)
+        cuda_out = _run_cuda_fwd_bwd(dynamics, device_cfg.device, q, qd, qdd, tau_bar)
+        assert all(np.isfinite(arr).all() for arr in cuda_out[:4])
+
+        rows = np.array([0, 1, 31, 32, 33, 511, 512, 998, 999])
+        ref_out = _numpy_fwd_bwd(kp, q[rows], qd[rows], qdd[rows], tau_bar[rows])
+        _assert_fwd_bwd_close([arr[rows] for arr in cuda_out[:4]], ref_out, "franka batch 1000")
+
+    @pytest.mark.parametrize("batch_size", [1, 5, 33, 129])
+    def test_unaligned_batches(self, batch_size):
+        """Batch sizes that do not fill a warp (UR10e, serial path)."""
+        kp, device_cfg = _load_robot("ur10e.yml")
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=50 + batch_size)
+        dynamics = _make_dynamics(kp, device_cfg, batch_size)
+        cuda_out = _run_cuda_fwd_bwd(dynamics, device_cfg.device, q, qd, qdd, tau_bar)
+        ref_out = _numpy_fwd_bwd(kp, q, qd, qdd, tau_bar)
+        _assert_fwd_bwd_close(cuda_out, ref_out, f"ur10e batch {batch_size}")
+
+    @pytest.mark.parametrize("robot_yml,batch_size", [("franka.yml", 32), ("unitree_g1.yml", 8)])
+    def test_partial_last_block(self, robot_yml, batch_size):
+        """A last block with fewer active batch elements than links (serial path).
+
+        The backward kernel loads the link inertias into block-shared memory
+        cooperatively; every row of a partially filled last block must still
+        see all of them.
+        """
+        kp, device_cfg = _load_robot(robot_yml)
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=50 + batch_size)
+        dynamics = _make_dynamics(kp, device_cfg, batch_size, threads_per_batch=1)
+        cuda_out = _run_cuda_fwd_bwd(dynamics, device_cfg.device, q, qd, qdd, tau_bar)
+        ref_out = _numpy_fwd_bwd(kp, q, qd, qdd, tau_bar)
+        _assert_fwd_bwd_close(
+            cuda_out, ref_out, f"{robot_yml} batch {batch_size} serial, partial last block"
+        )
+
+
+@pytest.mark.skipif(not PINOCCHIO_AVAILABLE, reason="Pinocchio not installed")
+class TestGradientsVsPinocchio:
+    """Gradients against Pinocchio's analytical RNEA derivatives (independent route)."""
+
+    @staticmethod
+    def _pin_force_vector(pin_model, kp, perm, f_ext_b):
+        """cuRobo wrenches [torque, force] per link -> Pinocchio forces per joint.
+
+        Wrenches on fixed links are not representable per joint in Pinocchio and
+        must be zero in f_ext_b.
+        """
+        from curobo.tests._src.robot.dynamics.rnea_numpy_reference import FIXED
+
+        joint_map = kp.joint_map.cpu().numpy()
+        joint_map_type = kp.joint_map_type.cpu().numpy()
+        fext = pin.StdVec_Force()
+        for _ in range(pin_model.njoints):
+            fext.append(pin.Force.Zero())
+        for k in range(kp.num_links):
+            if joint_map_type[k] == FIXED or joint_map[k] < 0:
+                assert np.all(f_ext_b[k] == 0.0)
+                continue
+            pin_joint = int(perm[int(joint_map[k])]) + 1
+            fext[pin_joint] = pin.Force(f_ext_b[k, 3:6], f_ext_b[k, 0:3])
+        return fext
+
+    @pytest.mark.parametrize("with_f_ext", [False, True])
+    @pytest.mark.parametrize("robot_yml", PARITY_ROBOTS)
+    def test_grads(self, robot_yml, with_f_ext):
+        """grad_q/qd/qdd = (dtau/dq, dtau/dv, dtau/da)^T tau_bar from Pinocchio."""
+        from curobo.tests._src.robot.dynamics.rnea_numpy_reference import FIXED
+
+        kp, device_cfg, pin_model, pin_data, perm = TestCUDAvsPinocchio._load_pin(robot_yml)
+        inv_perm = np.argsort(perm)
+        batch_size = 3
+        q, qd, qdd, tau_bar = _random_inputs(kp.num_dof, batch_size, seed=61)
+        f_ext = None
+        if with_f_ext:
+            rng = np.random.RandomState(62)
+            f_ext = rng.randn(batch_size, kp.num_links, 6)
+            joint_map = kp.joint_map.cpu().numpy()
+            joint_map_type = kp.joint_map_type.cpu().numpy()
+            for k in range(kp.num_links):
+                if joint_map_type[k] == FIXED or joint_map[k] < 0:
+                    f_ext[:, k, :] = 0.0
+
+        dynamics = _make_dynamics(kp, device_cfg, batch_size)
+        cuda_out = _run_cuda_fwd_bwd(dynamics, device_cfg.device, q, qd, qdd, tau_bar, f_ext)
+
+        for b in range(batch_size):
+            args = [pin_model, pin_data, q[b][inv_perm], qd[b][inv_perm], qdd[b][inv_perm]]
+            if with_f_ext:
+                args.append(self._pin_force_vector(pin_model, kp, perm, f_ext[b]))
+            tau_pin = np.array(pin.rnea(*args))[perm]
+            dtau_dq, dtau_dv, dtau_da = pin.computeRNEADerivatives(*args)
+            tau_bar_pin = tau_bar[b][inv_perm]
+            label = f"{robot_yml} f_ext={with_f_ext} b={b}"
+            np.testing.assert_allclose(cuda_out[0][b], tau_pin, err_msg=label + ": tau", **PARITY_TOL)
+            for name, got, mat in zip(
+                ["grad_q", "grad_qd", "grad_qdd"], cuda_out[1:4], (dtau_dq, dtau_dv, dtau_da)
+            ):
+                want = (np.asarray(mat).T @ tau_bar_pin)[perm]
+                np.testing.assert_allclose(got[b], want, err_msg=f"{label}: {name}", **PARITY_TOL)
