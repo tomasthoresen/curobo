@@ -40,6 +40,10 @@
  *   - N_LINKS, N_DOF: Compile-time smem layout, loop unrolling
  *   - TPB: Threads per batch (1=serial, >1=tree-parallel)
  *   - HAS_EXTERNAL_FORCES: When true, computes grad_f_ext = -f_bar
+ *
+ * The kernel body takes the link and DOF counts at runtime; the templated
+ * kernel passes its compile-time values, the `_rt` kernel takes them as
+ * arguments (compiled pybind backend, one instantiation per thread count).
  */
 
 #pragma once
@@ -51,19 +55,19 @@ namespace curobo {
 namespace dynamics {
 
 /**
- * @brief RNEA backward (VJP) kernel: computes grad_q, grad_qd, grad_qdd.
+ * @brief Shared body of the rnea backward kernels: link and DOF counts at runtime.
  *
- * @tparam N_LINKS Compile-time link count (must be > 0).
- * @tparam N_DOF   Compile-time DOF count (must be > 0).
- * @tparam TPB     Threads per batch element (must be power of 2, 1..32).
- * @tparam HAS_EXTERNAL_FORCES When true, computes grad_f_ext = -f_bar.
+ * Called by rnea_backward_kernel with its compile-time counts (the cuda.core
+ * path, one kernel per robot) and by rnea_backward_kernel_rt with runtime counts (the
+ * compiled pybind path, one kernel per thread count).
  *
- * @param grad_f_ext [batch_size, N_LINKS, 6] Gradient w.r.t. external forces.
- *                   Only written when HAS_EXTERNAL_FORCES=true.
- *                   Set to nullptr when HAS_EXTERNAL_FORCES=false.
+ * @tparam TPB Threads per batch element (power of 2, 1..32).
+ * @tparam HAS_EXTERNAL_FORCES See rnea_backward_kernel.
+ * @param n_links Number of links.
+ * @param n_dof   Number of degrees of freedom.
  */
-template<int N_LINKS, int N_DOF, int TPB = 1, bool HAS_EXTERNAL_FORCES = false>
-__global__ void rnea_backward_kernel(
+template<int TPB, bool HAS_EXTERNAL_FORCES>
+__device__ __forceinline__ void rnea_backward_body(
     float * __restrict__ grad_q,
     float * __restrict__ grad_qd,
     float * __restrict__ grad_qdd,
@@ -83,11 +87,10 @@ __global__ void rnea_backward_kernel(
     const int16_t * __restrict__ level_links,
     const float * __restrict__ forward_cache,
     const int batch_size,
-    const int n_levels
+    const int n_levels,
+    const int n_links,
+    const int n_dof
 ) {
-    static_assert(N_LINKS > 0, "N_LINKS must be > 0");
-    static_assert(N_DOF > 0, "N_DOF must be > 0");
-
     const int global_tid = blockDim.x * blockIdx.x + threadIdx.x;
     const int batch = global_tid / TPB;
     const int worker = (TPB > 1) ? (global_tid % TPB) : 0;
@@ -95,41 +98,43 @@ __global__ void rnea_backward_kernel(
     const bool active = (batch < batch_size);
 
     // ------------------------------------------------------------------
-    // Shared memory layout (compile-time offsets via N_LINKS):
+    // Shared memory layout (offsets from the runtime link count):
     //
     // Block-shared (robot params, same for all batches):
-    //   s_mc:      N_LINKS × 4  (mass + com xyz)
-    //   s_inertia: N_LINKS × 8  (inertia tensor, packed)
+    //   s_mc:      n_links × 4  (mass + com xyz)
+    //   s_inertia: n_links × 8  (inertia tensor, packed)
     //
     // Per-batch:
-    //   sv:     N_LINKS × 6  (velocity)
-    //   sa:     N_LINKS × 6  (acceleration)
-    //   sf:     N_LINKS × 6  (force → f_bar)
-    //   sa_bar: N_LINKS × 6  (acceleration adjoint)
-    //   sv_bar: N_LINKS × 6  (velocity adjoint)
+    //   sv:     n_links × 6  (velocity)
+    //   sa:     n_links × 6  (acceleration)
+    //   sf:     n_links × 6  (force → f_bar)
+    //   sa_bar: n_links × 6  (acceleration adjoint)
+    //   sv_bar: n_links × 6  (velocity adjoint)
     // ------------------------------------------------------------------
-    constexpr int SMEM_BLOCK_SHARED = N_LINKS * 12;  // mc(4) + inertia(8) per link
-    constexpr int SMEM_PER_BATCH = N_LINKS * SMEM_FLOATS_PER_LINK_BWD;
+    const int smem_block_shared = n_links * 12;  // mc(4) + inertia(8) per link
+    const int smem_per_batch = n_links * SMEM_FLOATS_PER_LINK_BWD;
     extern __shared__ __align__(16) float smem[];
 
     // Block-shared inertia params (one copy for entire block)
     float *s_mc      = &smem[0];
-    float *s_inertia = &smem[N_LINKS * 4];
+    float *s_inertia = &smem[n_links * 4];
 
     // Per-batch arrays (offset past block-shared region)
     const int local_batch = threadIdx.x / TPB;
-    float *sv     = &smem[SMEM_BLOCK_SHARED + local_batch * SMEM_PER_BATCH];
-    float *sa     = &smem[SMEM_BLOCK_SHARED + local_batch * SMEM_PER_BATCH + N_LINKS * 6];
-    float *sf     = &smem[SMEM_BLOCK_SHARED + local_batch * SMEM_PER_BATCH + N_LINKS * 12];
-    float *sa_bar = &smem[SMEM_BLOCK_SHARED + local_batch * SMEM_PER_BATCH + N_LINKS * 18];
-    float *sv_bar = &smem[SMEM_BLOCK_SHARED + local_batch * SMEM_PER_BATCH + N_LINKS * 24];
+    float *sv     = &smem[smem_block_shared + local_batch * smem_per_batch];
+    float *sa     = &smem[smem_block_shared + local_batch * smem_per_batch + n_links * 6];
+    float *sf     = &smem[smem_block_shared + local_batch * smem_per_batch + n_links * 12];
+    float *sa_bar = &smem[smem_block_shared + local_batch * smem_per_batch + n_links * 18];
+    float *sv_bar = &smem[smem_block_shared + local_batch * smem_per_batch + n_links * 24];
 
-    const int q_base = batch * N_DOF;
+    const int q_base = batch * n_dof;
 
     // Warp mask for intra-batch synchronization
-    unsigned batch_mask = 0;
+    // mask_t is 64 bits wide on HIP, where the warp-sync builtins require it.
+    curobo::common::mask_t batch_mask = 0;
     if (TPB > 1) {
-        constexpr unsigned tpb_mask = (TPB >= 32) ? 0xFFFFFFFFu : ((1u << TPB) - 1u);
+        constexpr curobo::common::mask_t tpb_mask =
+            (TPB >= 32) ? curobo::common::fullMask : ((1u << TPB) - 1u);
         const int lane = threadIdx.x & 31;
         batch_mask = tpb_mask << ((lane / TPB) * TPB);
     }
@@ -145,7 +150,7 @@ __global__ void rnea_backward_kernel(
     {
         const int batches_per_block = blockDim.x / TPB;
         const int total_threads = batches_per_block * TPB;
-        for (int k = threadIdx.x; k < N_LINKS; k += total_threads) {
+        for (int k = threadIdx.x; k < n_links; k += total_threads) {
             // Load mc (4 floats: mass, com_x, com_y, com_z)
             const float4 mc4 = *reinterpret_cast<const float4*>(&link_masses_com[k * 4]);
             *reinterpret_cast<float4*>(&s_mc[k * 4]) = mc4;
@@ -171,9 +176,9 @@ __global__ void rnea_backward_kernel(
     // Uses float4 vectorized global loads for bandwidth efficiency.
     // ==================================================================
     if (active) {
-        for (int k = worker; k < N_LINKS; k += TPB) {
+        for (int k = worker; k < n_links; k += TPB) {
             const float *cache_k = &forward_cache[
-                batch * N_LINKS * CACHE_FLOATS_PER_LINK
+                batch * n_links * CACHE_FLOATS_PER_LINK
                 + k * CACHE_FLOATS_PER_LINK];
             cache_load_va(&cache_k[CACHE_VA_OFFSET], &sv[k * 6], &sa[k * 6]);
             cache_load_f(&cache_k[CACHE_F_OFFSET], &sf[k * 6]);
@@ -265,8 +270,8 @@ __global__ void rnea_backward_kernel(
     // ==================================================================
     if constexpr (HAS_EXTERNAL_FORCES) {
         if (active) {
-            for (int k = worker; k < N_LINKS; k += TPB) {
-                float *gfext_k = &grad_f_ext[batch * N_LINKS * 6 + k * 6];
+            for (int k = worker; k < n_links; k += TPB) {
+                float *gfext_k = &grad_f_ext[batch * n_links * 6 + k * 6];
                 const float *fbar_k = &sf[k * 6];
                 for (int i = 0; i < 6; i++) {
                     gfext_k[i] = -fbar_k[i];
@@ -280,7 +285,7 @@ __global__ void rnea_backward_kernel(
     // Phase 3: Zero a_bar and v_bar accumulators (independent, distributed)
     // ==================================================================
     if (active) {
-        for (int k = worker; k < N_LINKS; k += TPB) {
+        for (int k = worker; k < n_links; k += TPB) {
             for (int i = 0; i < 6; i++) {
                 sa_bar[k * 6 + i] = 0.0f;
                 sv_bar[k * 6 + i] = 0.0f;
@@ -467,6 +472,124 @@ __global__ void rnea_backward_kernel(
         }
         if (TPB > 1) __syncwarp(batch_mask);
     }
+}
+
+/**
+ * @brief RNEA backward (VJP) kernel: computes grad_q, grad_qd, grad_qdd.
+ *
+ * @tparam N_LINKS Compile-time link count (must be > 0).
+ * @tparam N_DOF   Compile-time DOF count (must be > 0).
+ * @tparam TPB     Threads per batch element (must be power of 2, 1..32).
+ * @tparam HAS_EXTERNAL_FORCES When true, computes grad_f_ext = -f_bar.
+ *
+ * @param grad_f_ext [batch_size, N_LINKS, 6] Gradient w.r.t. external forces.
+ *                   Only written when HAS_EXTERNAL_FORCES=true.
+ *                   Set to nullptr when HAS_EXTERNAL_FORCES=false.
+ */
+template<int N_LINKS, int N_DOF, int TPB = 1, bool HAS_EXTERNAL_FORCES = false>
+__global__ void rnea_backward_kernel(
+    float * __restrict__ grad_q,
+    float * __restrict__ grad_qd,
+    float * __restrict__ grad_qdd,
+    float * __restrict__ grad_f_ext,  // Gradient w.r.t. external forces (or nullptr)
+    const float * __restrict__ grad_tau,
+    const float * __restrict__ q,
+    const float * __restrict__ qd,
+    const float * __restrict__ fixed_transforms,
+    const float * __restrict__ link_masses_com,
+    const float * __restrict__ link_inertias,
+    const int8_t * __restrict__ joint_map_type,
+    const int16_t * __restrict__ joint_map,
+    const int16_t * __restrict__ link_map,
+    const float * __restrict__ joint_offset_map,
+    const float * __restrict__ gravity,
+    const int16_t * __restrict__ level_starts,
+    const int16_t * __restrict__ level_links,
+    const float * __restrict__ forward_cache,
+    const int batch_size,
+    const int n_levels
+) {
+    static_assert(N_LINKS > 0, "N_LINKS must be > 0");
+    static_assert(N_DOF > 0, "N_DOF must be > 0");
+    rnea_backward_body<TPB, HAS_EXTERNAL_FORCES>(
+        grad_q,
+        grad_qd,
+        grad_qdd,
+        grad_f_ext,
+        grad_tau,
+        q,
+        qd,
+        fixed_transforms,
+        link_masses_com,
+        link_inertias,
+        joint_map_type,
+        joint_map,
+        link_map,
+        joint_offset_map,
+        gravity,
+        level_starts,
+        level_links,
+        forward_cache,
+        batch_size,
+        n_levels,
+        N_LINKS,
+        N_DOF);
+}
+
+/**
+ * @brief rnea_backward_kernel with the link and DOF counts as kernel arguments.
+ *
+ * Same contract as rnea_backward_kernel; used by the compiled (pybind) backend,
+ * which cannot instantiate a kernel per robot.
+ */
+template<int TPB, bool HAS_EXTERNAL_FORCES>
+__global__ void rnea_backward_kernel_rt(
+    float * __restrict__ grad_q,
+    float * __restrict__ grad_qd,
+    float * __restrict__ grad_qdd,
+    float * __restrict__ grad_f_ext,  // Gradient w.r.t. external forces (or nullptr)
+    const float * __restrict__ grad_tau,
+    const float * __restrict__ q,
+    const float * __restrict__ qd,
+    const float * __restrict__ fixed_transforms,
+    const float * __restrict__ link_masses_com,
+    const float * __restrict__ link_inertias,
+    const int8_t * __restrict__ joint_map_type,
+    const int16_t * __restrict__ joint_map,
+    const int16_t * __restrict__ link_map,
+    const float * __restrict__ joint_offset_map,
+    const float * __restrict__ gravity,
+    const int16_t * __restrict__ level_starts,
+    const int16_t * __restrict__ level_links,
+    const float * __restrict__ forward_cache,
+    const int batch_size,
+    const int n_levels,
+    const int n_links,
+    const int n_dof
+) {
+    rnea_backward_body<TPB, HAS_EXTERNAL_FORCES>(
+        grad_q,
+        grad_qd,
+        grad_qdd,
+        grad_f_ext,
+        grad_tau,
+        q,
+        qd,
+        fixed_transforms,
+        link_masses_com,
+        link_inertias,
+        joint_map_type,
+        joint_map,
+        link_map,
+        joint_offset_map,
+        gravity,
+        level_starts,
+        level_links,
+        forward_cache,
+        batch_size,
+        n_levels,
+        n_links,
+        n_dof);
 }
 
 } // namespace dynamics

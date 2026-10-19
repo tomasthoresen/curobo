@@ -1,11 +1,14 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
+ * Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
  */
 #pragma once
 
 // Reuse joint type constants and enum from kinematics
 #include "../kinematics/kinematics_constants.h"
+// Portable warp-sync mask type (64 bits on HIP)
+#include "../common/curobo_constants.h"
 
 namespace curobo {
 namespace dynamics {
