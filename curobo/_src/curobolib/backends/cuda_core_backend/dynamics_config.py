@@ -1,15 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
 #
 
 """Configuration for dynamics (RNEA) CUDA kernel compilation and launching."""
 
 # Standard Library
 from pathlib import Path
-from typing import List
-
-# Third Party
-from cuda.core import LaunchConfig
+from typing import List, Tuple
 
 # CuRobo
 from curobo._src.curobolib.backends.cuda_core_backend.kernel_config import CudaCoreKernelCfg
@@ -127,26 +125,20 @@ class DynamicsLaunchCfg:
         return best_batches
 
     @staticmethod
-    def calculate_forward_config(
+    def calculate_forward_geometry(
         batch_size: int,
         num_links: int,
         threads_per_batch: int = 1,
         max_batches_per_block: int = None,
         max_shared_mem: int = None,
-    ) -> LaunchConfig:
-        """Calculate launch configuration for RNEA forward kernel.
+    ) -> Tuple[int, int, int]:
+        """Launch geometry of the RNEA forward kernel, independent of cuda.core.
 
-        Shared memory per batch = num_links × 12 × 4 bytes (v + a).
-
-        Args:
-            batch_size: Number of batch elements.
-            num_links: Number of links in the robot.
-            threads_per_batch: Threads per batch element (1 for serial, >1 for tree-parallel).
-            max_batches_per_block: Maximum batches per block (default 256).
-            max_shared_mem: Maximum shared memory per block (default 48 KB).
+        The compiled backend mirrors this arithmetic; see calculate_forward_config
+        for the arguments.
 
         Returns:
-            LaunchConfig for the kernel.
+            (blocks per grid, threads per block, dynamic shared memory in bytes).
         """
         max_bpb = max_batches_per_block or DynamicsLaunchCfg.DEFAULT_MAX_BATCHES_PER_BLOCK
         max_shared_mem = max_shared_mem or DynamicsLaunchCfg.DEFAULT_MAX_SHARED_MEM
@@ -180,26 +172,19 @@ class DynamicsLaunchCfg:
         threads_per_block = batches_per_block * threads_per_batch
         blocks_per_grid = (batch_size + batches_per_block - 1) // batches_per_block
         shared_mem_size = batches_per_block * smem_per_batch
-
-        return LaunchConfig(
-            grid=blocks_per_grid,
-            block=threads_per_block,
-            shmem_size=shared_mem_size,
-        )
+        return blocks_per_grid, threads_per_block, shared_mem_size
 
     @staticmethod
-    def calculate_backward_config(
+    def calculate_forward_config(
         batch_size: int,
         num_links: int,
         threads_per_batch: int = 1,
         max_batches_per_block: int = None,
         max_shared_mem: int = None,
-    ) -> LaunchConfig:
-        """Calculate launch configuration for RNEA backward (VJP) kernel.
+    ) -> "LaunchConfig":
+        """Calculate launch configuration for RNEA forward kernel.
 
-        Shared memory layout:
-          - Block-shared: num_links × 12 × 4 bytes (mc + inertia, one copy per block)
-          - Per-batch: num_links × 30 × 4 bytes (v + a + f_bar + a_bar + v_bar)
+        Shared memory per batch = num_links × 12 × 4 bytes (v + a).
 
         Args:
             batch_size: Number of batch elements.
@@ -209,7 +194,36 @@ class DynamicsLaunchCfg:
             max_shared_mem: Maximum shared memory per block (default 48 KB).
 
         Returns:
-            LaunchConfig for the backward kernel.
+            LaunchConfig for the kernel.
+        """
+        from cuda.core import LaunchConfig
+
+        blocks_per_grid, threads_per_block, shared_mem_size = (
+            DynamicsLaunchCfg.calculate_forward_geometry(
+                batch_size, num_links, threads_per_batch, max_batches_per_block, max_shared_mem
+            )
+        )
+        return LaunchConfig(
+            grid=blocks_per_grid,
+            block=threads_per_block,
+            shmem_size=shared_mem_size,
+        )
+
+    @staticmethod
+    def calculate_backward_geometry(
+        batch_size: int,
+        num_links: int,
+        threads_per_batch: int = 1,
+        max_batches_per_block: int = None,
+        max_shared_mem: int = None,
+    ) -> Tuple[int, int, int]:
+        """Launch geometry of the RNEA backward kernel, independent of cuda.core.
+
+        The compiled backend mirrors this arithmetic; see calculate_backward_config
+        for the arguments and the shared-memory layout.
+
+        Returns:
+            (blocks per grid, threads per block, dynamic shared memory in bytes).
         """
         max_bpb = max_batches_per_block or DynamicsLaunchCfg.DEFAULT_MAX_BATCHES_PER_BLOCK
         max_shared_mem = max_shared_mem or DynamicsLaunchCfg.DEFAULT_MAX_SHARED_MEM
@@ -247,7 +261,39 @@ class DynamicsLaunchCfg:
         threads_per_block = batches_per_block * threads_per_batch
         blocks_per_grid = (batch_size + batches_per_block - 1) // batches_per_block
         shared_mem_size = smem_block_shared + batches_per_block * smem_per_batch
+        return blocks_per_grid, threads_per_block, shared_mem_size
 
+    @staticmethod
+    def calculate_backward_config(
+        batch_size: int,
+        num_links: int,
+        threads_per_batch: int = 1,
+        max_batches_per_block: int = None,
+        max_shared_mem: int = None,
+    ) -> "LaunchConfig":
+        """Calculate launch configuration for RNEA backward (VJP) kernel.
+
+        Shared memory layout:
+          - Block-shared: num_links × 12 × 4 bytes (mc + inertia, one copy per block)
+          - Per-batch: num_links × 30 × 4 bytes (v + a + f_bar + a_bar + v_bar)
+
+        Args:
+            batch_size: Number of batch elements.
+            num_links: Number of links in the robot.
+            threads_per_batch: Threads per batch element (1 for serial, >1 for tree-parallel).
+            max_batches_per_block: Maximum batches per block (default 256).
+            max_shared_mem: Maximum shared memory per block (default 48 KB).
+
+        Returns:
+            LaunchConfig for the backward kernel.
+        """
+        from cuda.core import LaunchConfig
+
+        blocks_per_grid, threads_per_block, shared_mem_size = (
+            DynamicsLaunchCfg.calculate_backward_geometry(
+                batch_size, num_links, threads_per_batch, max_batches_per_block, max_shared_mem
+            )
+        )
         return LaunchConfig(
             grid=blocks_per_grid,
             block=threads_per_block,
