@@ -83,8 +83,6 @@ pip install numpy setuptools packaging wheel
 git clone --branch amd-gfx1151-port https://github.com/tomasthoresen/curobo.git
 cd curobo && pip install -e .
 
-# torch.compile does not finish on this PyTorch build, see Limitations.
-export TORCHDYNAMO_DISABLE=1
 # Warp asks for this limit to be set before Python starts.
 export HSA_SCRATCH_SINGLE_LIMIT=1073741824
 python -m curobo.examples.getting_started.forward_kinematics --test
@@ -92,8 +90,7 @@ python -m curobo.examples.getting_started.inverse_kinematics --test
 python -m curobo.examples.getting_started.motion_planning --test
 ```
 
-Each self-test exits with status 0 on success. Without
-`TORCHDYNAMO_DISABLE=1` the second and third do not finish.
+Each self-test exits with status 0 on success.
 
 - The PyTorch wheel and the ROCm wheels it depends on are a download of
   several gigabytes.
@@ -120,9 +117,9 @@ Each self-test exits with status 0 on success. Without
 ### Limitations
 
 - `torch.compile` did not finish compiling cuRobo's solvers on the tested
-  PyTorch build. Set `TORCHDYNAMO_DISABLE=1` in the environment, or, in a
-  script, run `import curobo.runtime` and then
-  `curobo.runtime.torch_compile = False` before any other import from
+  PyTorch build, so `curobo.runtime.torch_compile` defaults to `False` on a
+  ROCm build of PyTorch. To turn it on, run `import curobo.runtime` and then
+  `curobo.runtime.torch_compile = True` before any other import from
   `curobo`: the setting is read when cuRobo's modules are imported.
 - The 64-lane warp mode of HIP is not supported; the kernels' lane masks are
   32 bits wide.

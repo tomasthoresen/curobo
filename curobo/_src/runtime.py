@@ -16,12 +16,15 @@ creating any cuRobo objects:
 
 from pathlib import Path
 
+import torch
+
 from curobo._src.util.logging import log_and_raise
 
 # --- torch.compile ---
 
-#: Enable ``torch.compile`` for eligible cuRobo kernels.
-torch_compile: bool = True
+#: Enable ``torch.compile`` for eligible cuRobo kernels. Off by default on a
+#: ROCm build of PyTorch, where compiling the solvers does not finish.
+torch_compile: bool = getattr(torch.version, "hip", None) is None
 
 #: Enable ``torch.compile`` for operations that are slow to compile.
 torch_compile_slow: bool = False
