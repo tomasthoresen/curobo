@@ -91,6 +91,19 @@ class TestCudaGraph:
         finally:
             curobo_runtime.cuda_graph_reset = original_value
 
+    @patch("torch.version.cuda", None)
+    def test_is_cuda_graph_reset_available_without_a_cuda_build(self):
+        # CuRobo
+        from curobo import runtime as curobo_runtime
+
+        original_value = curobo_runtime.cuda_graph_reset
+        try:
+            curobo_runtime.cuda_graph_reset = True
+            result = is_cuda_graph_reset_available()
+            assert result is False
+        finally:
+            curobo_runtime.cuda_graph_reset = original_value
+
 
 class TestTorchCompile:
     def test_is_torch_compile_available(self):

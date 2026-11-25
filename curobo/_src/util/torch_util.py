@@ -30,6 +30,11 @@ def is_cuda_graph_reset_available():
     if not curobo_runtime.cuda_graph_reset:
         return False
 
+    if torch.version.cuda is None:
+        # A build of PyTorch without CUDA, such as a ROCm build, reports no CUDA version.
+        log_warn("CUDA graph reset is only enabled for CUDA builds of PyTorch")
+        return False
+
     # CUDA graph reset requires CUDA 12.0+
     if version.parse(torch.version.cuda) >= version.parse("12.0"):
         return True
