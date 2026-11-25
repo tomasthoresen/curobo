@@ -115,6 +115,7 @@ exclude = ["tests"]
 [tool.setuptools.package-data]
 # Include kernel source files for cuda.core runtime compilation
 "curobo._src.curobolib.kernels" = ["**/*.cu", "**/*.cuh", "**/*.h"]
+"curobo._src.curobolib.backends.hip_core" = ["include/*.h"]
 
 [tool.ruff]
 line-length = 99

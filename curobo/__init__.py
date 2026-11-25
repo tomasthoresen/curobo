@@ -65,3 +65,8 @@ Public API Modules:
 """
 
 from curobo._version import __version__
+
+# On a ROCm build of PyTorch, serve the kernel backend's ``cuda.core`` imports from hip_core.
+from curobo._src.curobolib.backends.hip_core import install as _install_hip_core
+
+_install_hip_core()
