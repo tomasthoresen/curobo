@@ -331,6 +331,41 @@ def test_an_installed_cuda_package_is_resolved_without_importing_torch() -> None
     assert result.returncode == 0, result.stderr
 
 
+def test_an_installed_cuda_package_is_not_completed_on_a_rocm_torch(tmp_path) -> None:
+    """Also with a ROCm build of PyTorch, a ``cuda`` package on the path keeps its own contents."""
+    (tmp_path / "cuda").mkdir()
+    (tmp_path / "cuda" / "__init__.py").write_text("marker = 'installed'\n")
+    result = _run_with_stub_torch(
+        tmp_path,
+        _ROCM_TORCH,
+        """
+        import curobo
+        import cuda
+        assert cuda.marker == "installed"
+        for name in ("cuda.core", "cuda.pathfinder", "cuda.bindings", "cuda.bindings.runtime"):
+            try:
+                __import__(name)
+            except ImportError:
+                continue
+            raise AssertionError(f"{name} resolved")
+        """,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_pytorch_imported_after_curobo_finds_no_cuda_bindings() -> None:
+    """PyTorch probes for ``cuda.bindings`` when it is imported and must not adopt the stand-in."""
+    result = _run(
+        """
+        import curobo
+        import torch
+        import torch.cuda._utils as utils
+        assert utils._HAS_CUDA_BINDINGS is False
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @requires_hip
 def test_cuda_names_resolve_to_hip_core() -> None:
     result = _run(

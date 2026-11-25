@@ -104,6 +104,66 @@ def test_a_wrong_number_of_arguments_is_refused_before_the_launch(recorded) -> N
     assert recorded.calls == []
 
 
+@pytest.mark.parametrize(
+    "size,value,error",
+    [
+        (4, np.float64(1.0), TypeError),
+        (8, np.int32(1), TypeError),
+        (4, ctypes.c_double(1.0), TypeError),
+        (8, ctypes.c_int32(1), TypeError),
+        (4, True, TypeError),
+        (8, False, TypeError),
+        (4, 1.0, TypeError),
+        (4, 2**32, OverflowError),
+        (4, -(2**31) - 1, OverflowError),
+        (1, 256, OverflowError),
+        (8, 2**64, OverflowError),
+        (16, 1, TypeError),
+    ],
+)
+def test_a_value_that_does_not_fit_its_parameter_is_refused(recorded, size, value, error) -> None:
+    config = _launch.LaunchConfig(grid=1, block=1)
+    with pytest.raises(error):
+        _launch.launch(_launch.Stream(1), config, _FakeKernel(8, size), 0, value)
+    assert recorded.calls == []
+
+
+def test_values_of_the_parameter_size_are_passed_as_their_bytes(recorded) -> None:
+    kernel = _FakeKernel(4, 8, 1, 4, 2, 8)
+    config = _launch.LaunchConfig(grid=1, block=1)
+    arguments = (np.float32(2.5), 2.5, True, ctypes.c_int32(-7), np.int16(-2), -1)
+    _launch.launch(_launch.Stream(1), config, kernel, *arguments)
+    assert recorded.calls[0][4] == [
+        np.float32(2.5).tobytes(),
+        np.float64(2.5).tobytes(),
+        b"\x01",
+        np.int32(-7).tobytes(),
+        np.int16(-2).tobytes(),
+        np.int64(-1).tobytes(),
+    ]
+
+
+def test_a_launch_the_runtime_rejects_raises(monkeypatch) -> None:
+    class Rejecting(_RecordingRuntime):
+        cleared = 0
+
+        def hipModuleLaunchKernel(self, *arguments):
+            return 1
+
+        def hipGetLastError(self):
+            self.cleared += 1
+            return 1
+
+        def hipGetErrorString(self, code):
+            return b"invalid value"
+
+    runtime = Rejecting()
+    monkeypatch.setattr(_hip, "runtime", lambda: runtime)
+    with pytest.raises(RuntimeError, match="invalid value"):
+        _launch.launch(_launch.Stream(1), _launch.LaunchConfig(grid=1, block=1), _FakeKernel())
+    assert runtime.cleared == 1
+
+
 @pytest.mark.parametrize("dimensions", [(), (1, 1, 1, 1), [2, 2, 2, 2, 2]])
 def test_launch_config_refuses_other_than_one_to_three_dimensions(dimensions) -> None:
     with pytest.raises(ValueError, match="grid"):
