@@ -1,7 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
- * Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
  */
 
 #pragma once
@@ -33,16 +32,7 @@ namespace curobo{
         constexpr float  clampSelfCollisionSqMaxValue= 100.0f;
         constexpr int warpSize = 32;
         constexpr int blockSize = 1024;
-#ifdef __HIP_PLATFORM_AMD__
-        // HIP warp-sync intrinsics (__ballot_sync/__shfl_*_sync/__syncwarp)
-        // require a 64-bit mask argument. gfx1151 kernels run in wave32 mode,
-        // so lanes 0..31 participate and the low 32 bits are set.
-        using mask_t = unsigned long long;
-        constexpr mask_t fullMask = 0xffffffffull;
-#else
-        using mask_t = unsigned;
-        constexpr mask_t fullMask = 0xffffffffu;
-#endif
+        constexpr unsigned fullMask = 0xffffffffu;
         constexpr bool isVoltaPlus = true;
 
         // Geometry collision constants

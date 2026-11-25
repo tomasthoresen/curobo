@@ -12,11 +12,12 @@ from __future__ import annotations
 
 # Standard Library
 import copy
+import dataclasses
 from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
-import torch.autograd.profiler as profiler
 
 from curobo._src.curobolib.cuda_ops.kinematics import KinematicsFusedFunction
 from curobo._src.geom.types import tensor_sphere
@@ -37,6 +38,7 @@ from curobo._src.state.state_joint_ops import append_joints_to_state
 from curobo._src.types.device_cfg import DeviceCfg
 from curobo._src.types.pose import Pose
 from curobo._src.util.logging import log_and_raise
+from curobo._src.util.torch_util import get_profiler_context, get_profiler_decorator
 
 
 class KinematicsLoader(KinematicsLoaderCfg):
@@ -80,7 +82,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
         """Kinematics parser used to generate robot parameters."""
         return self._kinematics_parser
 
-    @profiler.record_function("robot_generator/initialize_tensors")
+    @get_profiler_decorator("robot_generator/initialize_tensors")
     def initialize_tensors(self):
         """Initialize tensors for kinematics representatiobn."""
         self._joint_limits = None
@@ -148,7 +150,6 @@ class KinematicsLoader(KinematicsLoaderCfg):
             link_chain_offsets=self._link_chain_offsets,
             joint_links_data=self._joint_links_data,
             joint_links_offsets=self._joint_links_offsets,
-            joint_affects_endeffector=self._joint_affects_endeffector,
             tool_frames=self.tool_frames,
             link_spheres=self._link_spheres_tensor,
             link_sphere_idx_map=self._link_sphere_idx_map,
@@ -211,7 +212,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
         )
         self.add_link(link_params)
 
-    @profiler.record_function("robot_generator/build_chain")
+    @get_profiler_decorator("robot_generator/build_chain")
     def _build_chain(
         self,
         base_link: str,
@@ -259,9 +260,125 @@ class KinematicsLoader(KinematicsLoaderCfg):
             if i not in chain_link_names:
                 self._add_body_to_tree(i, base=False)
                 chain_link_names.append(i)
+        joint_positions: Dict[str, float] = {}
+        if (
+            not self.load_collision_spheres
+            and self.cspace is not None
+            and self.cspace.default_joint_position is not None
+        ):
+            joint_positions.update(
+                zip(
+                    self.cspace.joint_names,
+                    self.cspace.default_joint_position.view(-1).tolist(),
+                    strict=True,
+                )
+            )
+        joint_positions.update(self.lock_joints or {})
+        self._retain_inertial_mimic_branches(chain_link_names, joint_positions)
+        self._lump_links_outside_tree(joint_positions)
 
         self.non_fixed_joint_names = self.joint_names.copy()
         return chain_link_names
+
+    def _retain_inertial_mimic_branches(
+        self, chain_link_names: List[str], joint_positions: Dict[str, float]
+    ) -> None:
+        """Keep physical mimic motion driven by modeled joints without adding active DOFs."""
+        parser = self._kinematics_parser
+        modeled_joints = set(self.joint_names)
+        for link_name in parser._parent_map:
+            if link_name in self._name_to_idx_map or not parser.has_link_mass(link_name):
+                continue
+            path = []
+            name = link_name
+            while name not in self._name_to_idx_map and name in parser._parent_map:
+                body = parser.get_link_parameters(name)
+                path.append(body)
+                name = body.parent_link_name
+            if name not in self._name_to_idx_map:
+                continue
+            moving = [
+                i
+                for i, body in enumerate(path)
+                if body.joint_type != JointType.FIXED and body.joint_name in modeled_joints
+            ]
+            if not moving:
+                continue
+            for body in reversed(path[min(moving) :]):
+                if body.joint_type != JointType.FIXED and body.joint_name not in modeled_joints:
+                    _, transform = parser.get_parent_transform(body.link_name, joint_positions)
+                    body = dataclasses.replace(
+                        body, joint_type=JointType.FIXED, fixed_transform=transform[:3, :4]
+                    )
+                self._add_body_to_tree(body.link_name, link_params=body)
+                chain_link_names.append(body.link_name)
+
+    def _lump_links_outside_tree(self, joint_positions: Dict[str, float]) -> None:
+        """Fold the mass of links left out of the tree into the tree link they hang from.
+
+        The tree holds only the links on a chain to a tool frame, a collision link or an extra
+        link's parent. A link outside it (a camera, an IMU, a foot sole, the bars of a passive
+        linkage) is dropped, and its mass with it. Add each such link that has a mass in the URDF
+        to the nearest tree link above it: mass sum, combined center of mass, and the inertia
+        about it (parallel-axis theorem, rotated into the tree link's frame).
+
+        Fixed and configured locked joints use their resolved transforms. Moving mimic
+        branches driven by modeled joints have already been retained in the tree.
+        Other unmodeled movable joints still use the zero-pose approximation.
+        """
+
+        def matrix(i: np.ndarray) -> np.ndarray:  # [ixx, iyy, izz, ixy, ixz, iyz] -> 3x3
+            return np.array([[i[0], i[3], i[4]], [i[3], i[1], i[5]], [i[4], i[5], i[2]]])
+
+        parser = self._kinematics_parser
+        lumped = {}  # tree link index -> [(mass, com, inertia 3x3)] in the tree link's frame
+        for link_name in parser._parent_map:
+            if link_name in self._name_to_idx_map or not parser.has_link_mass(link_name):
+                continue
+            # Compose tree_T_link using the resolved locked/default joint positions.
+            transform = np.eye(4)
+            name = link_name
+            while name not in self._name_to_idx_map:
+                parent = parser.get_parent_transform(name, joint_positions)
+                if parent is None:
+                    break  # the URDF root, above the tree's base link
+                name, parent_t_link = parent
+                transform = parent_t_link @ transform
+            if name not in self._name_to_idx_map:
+                continue
+            mass, com, inertia = parser.get_link_inertial(link_name)
+            rotation = transform[:3, :3]
+            lumped.setdefault(self._name_to_idx_map[name], []).append(
+                (mass, transform[:3, 3] + rotation @ com, rotation @ matrix(inertia) @ rotation.T)
+            )
+        for idx, parts in lumped.items():
+            body = self._bodies[idx]
+            com = np.asarray(body.link_com, dtype=np.float64)
+            parts = [(body.link_mass, com, matrix(body.link_inertia))] + parts
+            mass = sum(m for m, _, _ in parts)
+            com = sum(m * c for m, c, _ in parts) / mass
+            inertia_matrix = np.zeros((3, 3))
+            for m, c, inertia in parts:
+                d = c - com
+                inertia_matrix += inertia + m * (np.dot(d, d) * np.eye(3) - np.outer(d, d))
+            # a new LinkParams: an extra link's comes from the config and must stay as given
+            body = dataclasses.replace(
+                body,
+                link_mass=mass,
+                link_com=com,
+                link_inertia=inertia_matrix[[0, 1, 2, 0, 0, 1], [0, 1, 2, 1, 2, 2]],
+            )
+            self._bodies[idx] = body
+            self._link_masses_com[idx] = torch.as_tensor(
+                body.get_link_com_and_mass(),
+                device=self.cpu_tensor_args.device,
+                dtype=self.cpu_tensor_args.dtype,
+            ).unsqueeze(0)
+            self._link_inertias[idx][0, :6] = torch.as_tensor(
+                body.link_inertia,
+                device=self.cpu_tensor_args.device,
+                dtype=self.cpu_tensor_args.dtype,
+            )
 
     def _get_mimic_joint_data(self) -> Dict[str, List[int]]:
         """Get joints that are mimicked from actuated joints joints.
@@ -282,23 +399,16 @@ class KinematicsLoader(KinematicsLoaderCfg):
         return mimic_joint_data
 
     def _precompute_joint_mappings(
-        self, joint_map: List[int], ordered_link_names: List[str], base_link: str
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Precompute joint-link mappings and joint-endeffector interaction matrix.
-
-        This function precomputes which links are connected to each joint and creates
-        a joint-endeffector interaction matrix for efficient jacobian computation.
+        self, joint_map: List[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Precompute the physical links driven by each generalized coordinate.
 
         Args:
             joint_map: Mapping from link indices to joint indices
-            ordered_link_names: List of ordered link names for endeffector computation
-            base_link: Base link name for getting kinematic chains
-
         Returns:
             Tuple containing:
                 - joint_links_data_tensor: Flat tensor of link indices for each joint
                 - joint_links_offsets_tensor: Offset tensor for each joint's connected links
-                - joint_affects_endeffector_tensor: Boolean tensor for joint-endeffector interactions
         """
         # Precompute which links are connected to each joint for efficient jacobian
         # computation. This eliminates the need to search through all links in the
@@ -325,45 +435,9 @@ class KinematicsLoader(KinematicsLoaderCfg):
             joint_links_offsets, dtype=torch.int16, device=self.cpu_tensor_args.device
         )
 
-        # Precompute joint-endeffector interaction matrix for kernel optimization
-        # This eliminates nested loop searches in both forward and backward kernels
-        joint_affects_endeffector_data = []  # Flat boolean array
-        for joint_idx in range(len(self.joint_names)):
-            for ee_idx in range(len(ordered_link_names)):
-                ee_link_name = ordered_link_names[ee_idx]
-                ee_chain = self._kinematics_parser.get_chain(base_link, ee_link_name)
+        return joint_links_data_tensor, joint_links_offsets_tensor
 
-                # Check if this joint affects this end-effector
-                joint_affects_ee = False
-
-                # Get connected links for this joint
-                joint_start = joint_links_offsets[joint_idx]
-                joint_end = joint_links_offsets[joint_idx + 1]
-
-                for jl_idx in range(joint_start, joint_end):
-                    joint_link_idx = joint_links_data[jl_idx]
-                    joint_link_name = None
-
-                    # Find the link name from link index
-                    for link_name, link_idx in self._name_to_idx_map.items():
-                        if link_idx == joint_link_idx:
-                            joint_link_name = link_name
-                            break
-
-                    if joint_link_name and joint_link_name in ee_chain:
-                        joint_affects_ee = True
-                        break
-
-                joint_affects_endeffector_data.append(joint_affects_ee)
-
-        # Convert to tensor [njoints * n_tool_frames] - flattened row-major
-        joint_affects_endeffector_tensor = torch.tensor(
-            joint_affects_endeffector_data, dtype=torch.bool, device=self.cpu_tensor_args.device
-        )
-
-        return joint_links_data_tensor, joint_links_offsets_tensor, joint_affects_endeffector_tensor
-
-    @profiler.record_function("robot_generator/build_kinematics_tensors")
+    @get_profiler_decorator("robot_generator/build_kinematics_tensors")
     def _build_kinematics_tensors(self, base_link, tool_frames, chain_link_names):
         """Create kinematic tensors for robot given kinematic tree.
 
@@ -438,14 +512,8 @@ class KinematicsLoader(KinematicsLoaderCfg):
             chain_offsets, dtype=torch.int16, device=self.cpu_tensor_args.device
         )
 
-        # NEW: Precompute which links are connected to each joint for efficient jacobian
-        joint_links_data_tensor, joint_links_offsets_tensor, joint_affects_endeffector_tensor = (
-            self._precompute_joint_mappings(joint_map, ordered_link_names, base_link)
-        )
-
-        # Store precomputed joint-endeffector interaction matrix
-        self._joint_affects_endeffector = joint_affects_endeffector_tensor.to(
-            device=self.device_cfg.device
+        joint_links_data_tensor, joint_links_offsets_tensor = (
+            self._precompute_joint_mappings(joint_map)
         )
 
         self._link_map = torch.as_tensor(
@@ -484,7 +552,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
         )
         self._all_joint_names = all_joint_names
 
-    @profiler.record_function("robot_generator/build_kinematics")
+    @get_profiler_decorator("robot_generator/build_kinematics")
     def _build_kinematics(
         self, base_link: str, other_links: List[str], tool_frames: List[str]
     ):
@@ -581,10 +649,27 @@ class KinematicsLoader(KinematicsLoaderCfg):
             for joint_name in cspace_joint_names
             if joint_name not in active_tree_joint_names
         ]
+        default_cspace_lock_joints: Dict[str, float] = {}
+        if not self.load_collision_spheres and self.cspace.default_joint_position is not None:
+            default_joint_positions = self.cspace.default_joint_position.view(-1).tolist()
+            if len(default_joint_positions) != len(cspace_joint_names):
+                log_and_raise(
+                    "cspace.default_joint_position length does not match cspace.joint_names"
+                )
+            default_joint_position_map = dict(
+                zip(cspace_joint_names, default_joint_positions, strict=True)
+            )
+            default_cspace_lock_joints = {
+                joint_name: default_joint_position_map[joint_name]
+                for joint_name in cspace_only_joint_names
+                if joint_name not in configured_lock_joints
+                and joint_name in parser_actuated_joint_name_set
+            }
         unconfigured_cspace_only_joints = [
             joint_name
             for joint_name in cspace_only_joint_names
             if joint_name not in configured_lock_joints
+            and joint_name not in default_cspace_lock_joints
         ]
         invalid_cspace_lock_joints = [
             joint_name
@@ -600,6 +685,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
             and joint_name in parser_actuated_joint_name_set
             and joint_name not in resolved_tree_lock_joint_names
         }
+        cspace_lock_joints.update(default_cspace_lock_joints)
         missing_active_cspace_joints = [
             joint_name
             for joint_name in active_tree_joints
@@ -674,7 +760,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
 
         return cspace_lock_joints
 
-    @profiler.record_function("robot_generator/build_kinematics_with_lock_joints")
+    @get_profiler_decorator("robot_generator/build_kinematics_with_lock_joints")
     def _build_kinematics_with_lock_joints(
         self,
         base_link: str,
@@ -763,7 +849,6 @@ class KinematicsLoader(KinematicsLoaderCfg):
             link_chain_offsets=self._link_chain_offsets,
             joint_links_data=self._joint_links_data,
             joint_links_offsets=self._joint_links_offsets,
-            joint_affects_endeffector=self._joint_affects_endeffector,
             tool_frames=self.tool_frames,
             link_spheres=self._link_spheres_tensor,
             link_sphere_idx_map=self._link_sphere_idx_map,
@@ -782,7 +867,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
         )
         self.tool_frames = tool_frames
         # compute a fixed transform for fixing joints:
-        with profiler.record_function("cuda_robot_generator/fix_locked_joints"):
+        with get_profiler_context("cuda_robot_generator/fix_locked_joints"):
             # convert tensors to cpu:
             self._joint_map_type = self._joint_map_type.to(device=self.cpu_tensor_args.device)
             self._joint_map = self._joint_map.to(device=self.cpu_tensor_args.device)
@@ -827,8 +912,8 @@ class KinematicsLoader(KinematicsLoaderCfg):
             self._joint_map = self._joint_map.to(device=self.device_cfg.device)
             self._joint_map_type = self._joint_map_type.to(device=self.device_cfg.device)
         # recompute joint mappings as some joints are now fixed:
-        joint_links_data_tensor, joint_links_offsets_tensor, joint_affects_endeffector_tensor = (
-            self._precompute_joint_mappings(self._joint_map, self.tool_frames, base_link)
+        joint_links_data_tensor, joint_links_offsets_tensor = self._precompute_joint_mappings(
+            self._joint_map
         )
         self._joint_links_data = torch.as_tensor(
             joint_links_data_tensor, device=self.device_cfg.device
@@ -836,15 +921,12 @@ class KinematicsLoader(KinematicsLoaderCfg):
         self._joint_links_offsets = torch.as_tensor(
             joint_links_offsets_tensor, device=self.device_cfg.device
         )
-        self._joint_affects_endeffector = torch.as_tensor(
-            joint_affects_endeffector_tensor, device=self.device_cfg.device
-        )
 
         self._append_lock_joint_state(
             {joint_name: lock_joints[joint_name] for joint_name in lock_joint_names}
         )
 
-    @profiler.record_function("robot_generator/build_collision_model")
+    @get_profiler_decorator("robot_generator/build_collision_model")
     def _build_collision_model(
         self,
         collision_spheres: Dict,
@@ -865,7 +947,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
         cpu_tensor_args = DeviceCfg(device="cpu", dtype=torch.float32)
         self_collision_buffer = self.self_collision_buffer.copy()
 
-        with profiler.record_function("robot_generator/build_collision_spheres"):
+        with get_profiler_context("robot_generator/build_collision_spheres"):
             for j_idx, j in enumerate(collision_link_names):
                 num_spheres = len(collision_spheres[j])
                 link_spheres = torch.zeros(
@@ -914,17 +996,22 @@ class KinematicsLoader(KinematicsLoaderCfg):
             device_cfg=self.device_cfg,
         )
 
-    @profiler.record_function("robot_generator/add_body_to_tree")
-    def _add_body_to_tree(self, link_name: str, base=False):
+    @get_profiler_decorator("robot_generator/add_body_to_tree")
+    def _add_body_to_tree(
+        self, link_name: str, base: bool = False, link_params: Optional[LinkParams] = None
+    ) -> None:
         """Add link to kinematic tree.
 
         Args:
             link_name: Name of the link to add.
             base: Is this the base link of the kinematic tree?
+            link_params: Prepared parameters for a dynamics-only branch, when supplied.
         """
         body_idx = len(self._bodies)
 
-        rigid_body_params = self._kinematics_parser.get_link_parameters(link_name, base=base)
+        rigid_body_params = link_params
+        if rigid_body_params is None:
+            rigid_body_params = self._kinematics_parser.get_link_parameters(link_name, base=base)
         self._bodies.append(rigid_body_params)
         if rigid_body_params.joint_type != JointType.FIXED:
             self._controlled_links.append(body_idx)
@@ -972,6 +1059,8 @@ class KinematicsLoader(KinematicsLoaderCfg):
 
         for j in joint_names:
             for bi, b in enumerate(self._bodies):
+                if b.joint_type == JointType.FIXED:
+                    continue
                 if b.joint_name == j:
                     if j not in j_data:
                         j_data[j] = {}
@@ -993,7 +1082,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
 
         return j_data
 
-    @profiler.record_function("robot_generator/get_link_poses")
+    @get_profiler_decorator("robot_generator/get_link_poses")
     def _get_link_poses(
         self, q: torch.Tensor, query_link_names: List[str], kinematics_config: KinematicsParams
     ) -> Pose:
@@ -1035,7 +1124,6 @@ class KinematicsLoader(KinematicsLoaderCfg):
             buffers["batch_cumul_mat"],
             kinematics_config,
             buffers["grad_out_q"],
-            buffers["grad_out_q_jacobian"],
             buffers["grad_in_link_pos"],
             buffers["grad_in_link_quat"],
             buffers["grad_in_robot_spheres"],
@@ -1069,7 +1157,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
         """Get joint limits for the robot."""
         return self._joint_limits
 
-    @profiler.record_function("robot_generator/get_joint_limits")
+    @get_profiler_decorator("robot_generator/get_joint_limits")
     def _get_joint_position_velocity_limits(self) -> Dict[str, torch.Tensor]:
         """Compute joint position and velocity limits for the robot.
 
@@ -1098,7 +1186,7 @@ class KinematicsLoader(KinematicsLoaderCfg):
             )
         return joint_limits
 
-    @profiler.record_function("robot_generator/update_joint_limits")
+    @get_profiler_decorator("robot_generator/update_joint_limits")
     def _update_joint_limits(self):
         """Update limits from CSpaceParams (acceleration, jerk limits and position clips)."""
         joint_limits = self._get_joint_position_velocity_limits()
@@ -1118,7 +1206,6 @@ class KinematicsLoader(KinematicsLoaderCfg):
         # clip joint position:
         joint_limits["position"][0] += self.cspace.position_limit_clip
         joint_limits["position"][1] -= self.cspace.position_limit_clip
-        joint_limits["velocity"][0] *= self.cspace.velocity_scale
-        joint_limits["velocity"][1] *= self.cspace.velocity_scale
 
         self._joint_limits = JointLimits(joint_names=self.joint_names, **joint_limits)
+        self._joint_limits = self.cspace.scale_joint_limits(self._joint_limits)

@@ -63,6 +63,37 @@ class TestKinematicsParamsProperties:
         assert isinstance(num, int)
         assert num == 7  # Franka has 7 DOF
 
+    def test_topology_caches_are_stored_and_cloneable(self, franka_kinematics_cfg):
+        """Store reusable Jacobian/backward topology maps in KinematicsParams."""
+        config = franka_kinematics_cfg
+        assert config.joint_link_influence_words.shape == (
+            config.num_links,
+            (config.num_links + 31) // 32,
+        )
+        assert config.joint_link_influence_words.dtype == torch.int32
+        assert config.tool_joint_links_offsets.shape == (
+            config.num_pose_links * config.num_dof + 1,
+        )
+        assert config.tool_joint_links_offsets.dtype == torch.int16
+        assert config.tool_joint_links_data.dtype == torch.int16
+        assert int(config.tool_joint_links_offsets[-1].item()) == (
+            config.tool_joint_links_data.numel()
+        )
+
+        cloned = config.clone()
+        torch.testing.assert_close(
+            cloned.joint_link_influence_words,
+            config.joint_link_influence_words,
+        )
+        torch.testing.assert_close(
+            cloned.tool_joint_links_data,
+            config.tool_joint_links_data,
+        )
+        torch.testing.assert_close(
+            cloned.tool_joint_links_offsets,
+            config.tool_joint_links_offsets,
+        )
+
 
 class TestKinematicsParamsSphereOperations:
     """Test sphere-related methods of KinematicsParams."""
@@ -267,6 +298,22 @@ class TestKinematicsParamsMethods:
         assert cloned.joint_names == franka_kinematics_cfg.joint_names
         assert cloned.tool_frames == franka_kinematics_cfg.tool_frames
         assert torch.equal(cloned.link_spheres, franka_kinematics_cfg.link_spheres)
+
+    def test_clone_preserves_scaled_joint_limits(self) -> None:
+        """Repeated clones preserve already-scaled limits without scaling them again."""
+        robot_data = load_yaml(join_path(get_robot_configs_path(), "franka.yml"))
+        cspace = robot_data["robot_cfg"]["kinematics"]["cspace"]
+        cspace.update(velocity_scale=0.5, acceleration_scale=0.4, jerk_scale=0.3)
+        params = KinematicsCfg.from_robot_yaml_file(robot_data).kinematics_config
+        expected = {
+            field: getattr(params.joint_limits, field).clone()
+            for field in ("position", "velocity", "acceleration", "jerk", "effort")
+        }
+
+        for _ in range(2):
+            params = params.clone()
+            for field, limits in expected.items():
+                torch.testing.assert_close(getattr(params.joint_limits, field), limits)
 
     def test_kinematics_device_cfg_make_contiguous(self, franka_kinematics_cfg):
         """Test make_contiguous method."""

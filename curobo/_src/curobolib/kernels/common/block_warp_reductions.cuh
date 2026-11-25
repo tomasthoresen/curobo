@@ -1,7 +1,6 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
- * Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
  */
 
 
@@ -50,28 +49,25 @@ struct ReductionOperator<ReductionOp::MAX> {
 
 // Templated warp reduction with operation support
 template<typename ValueType, ReductionOp Op = ReductionOp::SUM>
-__forceinline__ __device__ ValueType warp_reduce(ValueType v, const int elems)
+__forceinline__ __device__ ValueType warp_reduce(ValueType v, const int num_elements)
 {
-    // Ballot over the currently-active lanes. HIP's warp-sync intrinsics
-    // assert that the mask equals the active-lane set (__ballot(true)) and
-    // trap otherwise; a block smaller than a warp (threadsPerBlock < warpSize,
-    // e.g. opt_dim = 7 in the line-search and L-BFGS kernels) makes a fixed
-    // full mask invalid. __activemask() is that set exactly, and the ballot
-    // return value is unchanged. auto adapts to the platform mask width.
-    auto mask = __ballot_sync(__activemask(), true);
-
+    const unsigned active_mask = __activemask();
     ValueType val = v;
-    uint8_t lane_idx = threadIdx.x % 32;
+    const uint8_t lane_idx = threadIdx.x % curobo::common::warpSize;
+    const uint8_t valid_lanes = static_cast<uint8_t>(
+      num_elements <= 0 ? 0 :
+      (num_elements < curobo::common::warpSize ? num_elements : curobo::common::warpSize));
+    const unsigned mask = __ballot_sync(active_mask, lane_idx < valid_lanes);
+    if (lane_idx >= valid_lanes)
+    {
+        return val;
+    }
 
     #pragma unroll
-    for (uint8_t offset = 32 / 2; offset > 0; offset /= 2) {
-        // shfl_down_sync has undefined behavior when (lane_idx + offset) > elems
+    for (uint8_t offset = curobo::common::warpSize / 2; offset > 0; offset /= 2) {
         const ValueType other_value = __shfl_down_sync(mask, val, offset);
-
-        // 1ULL avoids shifting a 32-bit int by >= 32 (undefined) when
-        // lane_idx + offset exceeds 31; those high bits are never set in the
-        // wave32 mask, so the test result is unchanged.
-        if ((1ULL << (lane_idx + offset)) & mask) {
+        const uint8_t source_lane = lane_idx + offset;
+        if (source_lane < valid_lanes && ((1u << source_lane) & mask)) {
             val = ReductionOperator<Op>::apply(val, other_value);
         }
     }
@@ -86,10 +82,14 @@ __forceinline__ __device__ void block_reduce(ValueType v,
                                           ValueType *data,
                                           ValueType *result)
 {
-    ValueType val = warp_reduce<ValueType, Op>(v, num_elements);
+    const int warp_start = (threadIdx.x / curobo::common::warpSize) * curobo::common::warpSize;
+    const int remaining_elements = num_elements - warp_start;
+    const int warp_elements = remaining_elements > curobo::common::warpSize ?
+      curobo::common::warpSize : (remaining_elements > 0 ? remaining_elements : 0);
+    ValueType val = warp_reduce<ValueType, Op>(v, warp_elements);
     const uint8_t leader = 0;
 
-    if (num_elements < 32) // only one warp is active
+    if (num_elements <= curobo::common::warpSize) // only one warp is active
     {
         if (threadIdx.x == leader)
         {
@@ -129,7 +129,9 @@ __forceinline__ __device__ void segmented_block_reduce(
                                           const int local_thread_idx,
                                           const int segment_idx)
 {
-    ValueType val = warp_reduce<ValueType, Op>(register_value, num_elements);
+    ValueType val = warp_reduce<ValueType, Op>(
+      register_value,
+      num_elements < curobo::common::warpSize ? num_elements : curobo::common::warpSize);
     const uint8_t leader = 0;
     const int warps_per_segment = (num_elements + 31) / 32; // Need to compute this correctly.
 

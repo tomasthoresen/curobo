@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+from __future__ import annotations
+
 # Standard Library
 import inspect
+from contextlib import AbstractContextManager, nullcontext
 from functools import wraps
+from typing import Callable
 
 # Third Party
 import torch
@@ -24,6 +28,11 @@ def is_cuda_graph_available():
 
 def is_cuda_graph_reset_available():
     if not curobo_runtime.cuda_graph_reset:
+        return False
+
+    if torch.version.cuda is None:
+        # A build of PyTorch without CUDA, such as a ROCm build, reports no CUDA version.
+        log_warn("CUDA graph reset is only enabled for CUDA builds of PyTorch")
         return False
 
     # CUDA graph reset requires CUDA 12.0+
@@ -142,10 +151,18 @@ def get_torch_jit_decorator(
         return empty_decorator
 
 
-def get_profiler_decorator(str_name: str):
+def get_profiler_decorator(str_name: str) -> Callable:
+    """Return a labelled decorator, or the identity when profiling is disabled."""
     if curobo_runtime.profiler:
         return profiler.record_function(str_name)
     return empty_decorator
+
+
+def get_profiler_context(str_name: str) -> AbstractContextManager[None]:
+    """Return a labelled context, checking the profiler flag for each scope."""
+    if curobo_runtime.profiler:
+        return profiler.record_function(str_name)
+    return nullcontext()
 
 
 def profile_class_methods(cls):

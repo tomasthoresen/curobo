@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 
+import copy
+
+import numpy as np
 import pytest
 import torch
 
@@ -99,6 +102,45 @@ def test_cuda_robot_generator_config_cspace():
     assert len(robot_generator.cspace.max_jerk) == 7
 
 
+@pytest.mark.parametrize(
+    "scales",
+    [
+        (0.5, 1.0, 1.0),
+        (1.0, 0.5, 1.0),
+        (1.0, 1.0, 0.5),
+        (0.5, 0.4, 0.3),
+        (
+            [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+            [0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2],
+            [0.3, 0.5, 0.7, 0.9, 0.2, 0.4, 0.6],
+        ),
+    ],
+    ids=["velocity", "acceleration", "jerk", "combined", "per_joint"],
+)
+def test_cspace_limit_scales_apply_once(scales: tuple[float | list[float], ...]) -> None:
+    """Apply scalar and per-joint derivative scales once, independently."""
+    robot_file = "franka.yml"
+    robot_params = load_yaml(join_path(get_robot_configs_path(), robot_file))["robot_cfg"][
+        "kinematics"
+    ]
+    base_limits = KinematicsLoader(
+        KinematicsLoaderCfg(**copy.deepcopy(robot_params))
+    ).kinematics_config.joint_limits
+
+    scaled_params = copy.deepcopy(robot_params)
+    for field, scale in zip(("velocity", "acceleration", "jerk"), scales):
+        scaled_params["cspace"][field + "_scale"] = scale
+    scaled_limits = KinematicsLoader(
+        KinematicsLoaderCfg(**scaled_params)
+    ).kinematics_config.joint_limits
+
+    for field, scale in zip(("velocity", "acceleration", "jerk"), scales):
+        base = getattr(base_limits, field)
+        torch.testing.assert_close(getattr(scaled_limits, field), base * base.new_tensor(scale))
+    torch.testing.assert_close(scaled_limits.position, base_limits.position)
+    torch.testing.assert_close(scaled_limits.effort, base_limits.effort)
+
+
 def test_cspace_only_configured_lock_joint_uses_configured_value():
     robot_params = _load_simple_mimic_params()
     robot_params["tool_frames"] = ["chain_1_link_2"]
@@ -131,6 +173,65 @@ def test_configured_lock_joint_must_resolve_to_tree_or_cspace():
 def test_cspace_only_name_must_be_configured_lock():
     robot_params = _load_simple_mimic_params()
     robot_params["lock_joints"] = None
+    _add_cspace_joint(robot_params, "joint_typo")
+
+    with pytest.raises(ValueError, match="not active in the configured tree"):
+        KinematicsLoader(_cpu_loader_cfg(robot_params))
+
+
+def test_collision_pruned_cspace_joints_use_default_lock_positions():
+    robot_params = load_yaml(join_path(get_robot_configs_path(), "unitree_g1.yml"))[
+        "kinematics"
+    ]
+    robot_params["load_collision_spheres"] = False
+    default_positions = dict(
+        zip(
+            robot_params["cspace"]["joint_names"],
+            robot_params["cspace"]["default_joint_position"],
+            strict=True,
+        )
+    )
+    expected_lock_names = [
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+    ]
+
+    robot_generator = KinematicsLoader(_cpu_loader_cfg(robot_params))
+
+    assert robot_generator.total_spheres == 0
+    assert robot_generator.lock_jointstate.joint_names == expected_lock_names
+    assert torch.allclose(
+        robot_generator.lock_jointstate.position,
+        torch.tensor(
+            [default_positions[name] for name in expected_lock_names],
+            device=robot_generator.device_cfg.device,
+        ),
+    )
+
+
+def test_collision_pruned_cspace_joint_without_default_requires_lock():
+    robot_params = _load_simple_mimic_params()
+    robot_params["tool_frames"] = ["chain_1_link_2"]
+    robot_params["lock_joints"] = None
+    robot_params["load_collision_spheres"] = False
+    robot_params["cspace"]["default_joint_position"] = None
+
+    with pytest.raises(ValueError, match="not explicitly locked"):
+        KinematicsLoader(_cpu_loader_cfg(robot_params))
+
+
+def test_collision_pruning_does_not_hide_unknown_cspace_joint():
+    robot_params = _load_simple_mimic_params()
+    robot_params["lock_joints"] = None
+    robot_params["load_collision_spheres"] = False
     _add_cspace_joint(robot_params, "joint_typo")
 
     with pytest.raises(ValueError, match="not active in the configured tree"):
@@ -192,3 +293,32 @@ def test_cspace_lock_updates_non_fixed_names_when_tree_lock_exists(monkeypatch):
         "active_joint_2",
     ]
     assert "active_joint_2" not in robot_generator.joint_names
+
+
+def test_link_inertials_outside_the_tree_are_lumped_into_their_tree_link(lumped_inertial_robot):
+    """Links the tree leaves out keep their mass: it is folded into the nearest tree link."""
+    robot = lumped_inertial_robot
+    kp = KinematicsLoader(
+        _cpu_loader_cfg(
+            {
+                "urdf_path": str(robot.urdf_path),
+                "base_link": "base_link",
+                "tool_frames": ["arm_link"],
+            }
+        )
+    ).kinematics_config
+    names = kp.link_name_to_idx_map
+    assert not {"camera_link", "mount_link", "bar_link"} & set(names)  # outside the tree
+    mc = kp.link_masses_com[names["arm_link"]].numpy()
+    six = kp.link_inertias[names["arm_link"], :6].numpy()
+    assert mc[3] == pytest.approx(robot.mass, rel=1e-6)
+    np.testing.assert_allclose(mc[:3], robot.com, atol=1e-6, err_msg="center of mass (link frame)")
+    np.testing.assert_allclose(
+        six,
+        robot.inertia[[0, 1, 2, 0, 0, 1], [0, 1, 2, 1, 2, 2]],
+        atol=1e-6,
+        err_msg="inertia about the COM, link axes [ixx, iyy, izz, ixy, ixz, iyz]",
+    )
+    # a tree link with nothing fixed to it keeps its own URDF values
+    base = kp.link_masses_com[names["base_link"]].numpy()
+    np.testing.assert_allclose(base, [0.0, 0.0, 0.0, 5.0], atol=1e-6)

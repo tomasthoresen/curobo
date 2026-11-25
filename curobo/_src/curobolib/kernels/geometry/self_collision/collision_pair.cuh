@@ -1,12 +1,10 @@
 /*
  * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
- * Modified 2026 by Tomas Thoresen: port to AMD ROCm/HIP (gfx1151).
  */
 
 #pragma once
 
-#include "common/curobo_constants.h"
 
 namespace curobo{
     namespace geometry{
@@ -17,10 +15,8 @@ namespace curobo{
       int16_t i; // 16 bits
       int16_t j; // 16 bits
 
-      // Default constructor — trivial so instances can live in __shared__
-      // memory. HIP/clang rejects a non-trivial constructor on a __shared__
-      // variable; shared instances here are explicitly initialized before use.
-      __host__ __device__ CollisionPair() = default;
+      // Default constructor
+      __host__ __device__ CollisionPair() : d(0.0f), i(0), j(0) {}
 
       // Constructor with parameters
       __host__ __device__ CollisionPair(float distance, int16_t idx_i, int16_t idx_j) : d(distance), i(idx_i), j(idx_j) {}
@@ -96,7 +92,7 @@ namespace curobo{
     }
 
 
-    __device__ CollisionPair __shfl_down_sync(const curobo::common::mask_t mask, const CollisionPair &a, const int &offset)
+    __device__ CollisionPair __shfl_down_sync(const unsigned mask, const CollisionPair &a, const int &offset)
     {
         // convert collision pair to uint64_t
 
