@@ -72,6 +72,11 @@ compiled at install time. Warp and hipRTC load ROCm libraries at run time; a
 ROCm install without an `ld.so.conf.d` entry needs its library directory on
 `LD_LIBRARY_PATH`.
 
+The kernels include `<stdint.h>` and `<stddef.h>`, which hipRTC takes from the
+host compiler: a GCC installation with its headers under
+`/usr/lib/gcc/*/*/include` is required (on Ubuntu, the `build-essential`
+package).
+
 ```bash
 python -m curobo.examples.getting_started.forward_kinematics --test
 python -m curobo.examples.getting_started.inverse_kinematics --test
