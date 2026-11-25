@@ -66,30 +66,64 @@ installed before cuRobo so that it satisfies the `warp-lang` dependency.
 
 ### Use
 
-Install the ROCm build of PyTorch and the Warp branch into a Python
-environment, then install this repository with `pip install -e .`. Nothing is
-compiled at install time. Warp and hipRTC load ROCm libraries at run time; a
-ROCm install without an `ld.so.conf.d` entry needs its library directory on
-`LD_LIBRARY_PATH`.
-
-The kernels include `<stdint.h>` and `<stddef.h>`, which hipRTC takes from the
-host compiler: a GCC installation with its headers under
-`/usr/lib/gcc/*/*/include` is required (on Ubuntu, the `build-essential`
-package).
+The commands below create an environment, install the ROCm build of PyTorch,
+build and install the Warp branch, install this repository and run its three
+self-tests. They need ROCm installed under `/opt/rocm`, GCC, git and git-lfs,
+and network access during the Warp build. Nothing is compiled when cuRobo is
+installed.
 
 ```bash
+python3.12 -m venv venv && . venv/bin/activate
+pip install torch==2.14.0+rocm7.14 --index-url https://download.pytorch.org/whl/rocm7.14
+
+git clone --depth 1 --branch tomas/halo-v1.17.0 https://github.com/tomasthoresen/warp.git
+pip install numpy setuptools packaging wheel
+(cd warp && ./build_amd.sh && pip install -e .)
+
+git clone --branch amd-gfx1151-port https://github.com/tomasthoresen/curobo.git
+cd curobo && pip install -e .
+
+# torch.compile does not finish on this PyTorch build, see Limitations.
+export TORCHDYNAMO_DISABLE=1
+# Warp asks for this limit to be set before Python starts.
+export HSA_SCRATCH_SINGLE_LIMIT=1073741824
 python -m curobo.examples.getting_started.forward_kinematics --test
 python -m curobo.examples.getting_started.inverse_kinematics --test
 python -m curobo.examples.getting_started.motion_planning --test
 ```
 
-Each command exits with status 0 on success.
+Each self-test exits with status 0 on success. Without
+`TORCHDYNAMO_DISABLE=1` the second and third do not finish.
+
+- The PyTorch wheel and the ROCm wheels it depends on are a download of
+  several gigabytes.
+- `README-AMD.md` in the Warp branch describes the Warp build and its
+  requirements. Where it names another repository, branch, ROCm version or
+  PyTorch index than this section, this section is the configuration tested
+  with cuRobo.
+- Start Python from a directory other than the one that holds the `warp`
+  clone; from there the clone's directory is imported in place of the
+  installed package.
+- The first run of each self-test compiles the kernels and prints little
+  while it does.
+- Warnings that mention `hipblasLtMatmul` are printed on the tested
+  configuration; the self-tests pass with them. Without
+  `HSA_SCRATCH_SINGLE_LIMIT` Warp prints a notice that asks for it; the
+  self-tests pass either way.
+- Warp and hipRTC load ROCm libraries at run time. A ROCm install without an
+  `ld.so.conf.d` entry needs its library directory on `LD_LIBRARY_PATH`.
+- The kernels include `<stdint.h>` and `<stddef.h>`, which hipRTC takes from
+  the host compiler: a GCC installation with its headers under
+  `/usr/lib/gcc/*/*/include` is required (on Ubuntu, the `build-essential`
+  package).
 
 ### Limitations
 
 - `torch.compile` did not finish compiling cuRobo's solvers on the tested
-  PyTorch build. Set `curobo.runtime.torch_compile = False` before creating a
-  solver, or set `TORCHDYNAMO_DISABLE=1` in the environment.
+  PyTorch build. Set `TORCHDYNAMO_DISABLE=1` in the environment, or, in a
+  script, run `import curobo.runtime` and then
+  `curobo.runtime.torch_compile = False` before any other import from
+  `curobo`: the setting is read when cuRobo's modules are imported.
 - The 64-lane warp mode of HIP is not supported; the kernels' lane masks are
   32 bits wide.
 - `kernel_lbfgs_step_compact` uses NVIDIA tensor-core intrinsics and does not
