@@ -133,5 +133,7 @@ def interpolate_spline(trajectory: SplineTrajectory, samples: int, dt: float) ->
         samples,
         timing.time.shape[1] if retimed else 0,
         np.float32(dt),
+        np.float32(0.0),
+        np.float32(trajectory.duration.item()),
     )
     return output
